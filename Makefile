@@ -107,15 +107,6 @@ start-docker: ## Starts the docker containers for local development.
 		docker start mattermost-mysql > /dev/null; \
 	fi
 
-	@if [ $(shell docker ps -a | grep -ci mattermost-postgres) -eq 0 ]; then \
-		echo starting mattermost-postgres; \
-		docker run --name mattermost-postgres -p 5432:5432 -e POSTGRES_USER=mmuser -e POSTGRES_PASSWORD=mostest -e POSTGRES_DB=mattermost_test \
-		-d postgres:9.4 > /dev/null; \
-	elif [ $(shell docker ps | grep -ci mattermost-postgres) -eq 0 ]; then \
-		echo restarting mattermost-postgres; \
-		docker start mattermost-postgres > /dev/null; \
-	fi
-
 	@if [ $(shell docker ps -a | grep -ci mattermost-inbucket) -eq 0 ]; then \
 		echo starting mattermost-inbucket; \
 		docker run --name mattermost-inbucket -p 9000:10080 -p 2500:10025 -d jhillyerd/inbucket:release-1.2.0 > /dev/null; \

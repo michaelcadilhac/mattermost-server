@@ -202,6 +202,7 @@ func (a *App) trackConfig() {
 		"enable_post_icon_override":                               cfg.ServiceSettings.EnablePostIconOverride,
 		"enable_apiv3":                                            *cfg.ServiceSettings.EnableAPIv3,
 		"enable_user_access_tokens":                               *cfg.ServiceSettings.EnableUserAccessTokens,
+		"enable_inline_latex":                                     *cfg.ServiceSettings.EnableInlineLaTeX,
 		"enable_custom_emoji":                                     *cfg.ServiceSettings.EnableCustomEmoji,
 		"enable_emoji_picker":                                     *cfg.ServiceSettings.EnableEmojiPicker,
 		"experimental_enable_authentication_transfer":             *cfg.ServiceSettings.ExperimentalEnableAuthenticationTransfer,

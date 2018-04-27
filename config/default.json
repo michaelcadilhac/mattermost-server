@@ -42,6 +42,7 @@
         "WebsocketSecurePort": 443,
         "WebsocketPort": 80,
         "WebserverMode": "gzip",
+        "EnableInlineLaTeX": false,
         "EnableCustomEmoji": false,
         "EnableEmojiPicker": true,
         "RestrictCustomEmojiCreation": "all",

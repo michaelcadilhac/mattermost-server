@@ -204,6 +204,7 @@ type ServiceSettings struct {
 	WebsocketSecurePort                               *int
 	WebsocketPort                                     *int
 	WebserverMode                                     *string
+	EnableInlineLaTeX                                 *bool
 	EnableCustomEmoji                                 *bool
 	EnableEmojiPicker                                 *bool
 	RestrictCustomEmojiCreation                       *string
@@ -400,6 +401,10 @@ func (s *ServiceSettings) SetDefaults() {
 		s.WebserverMode = NewString("gzip")
 	} else if *s.WebserverMode == "regular" {
 		*s.WebserverMode = "gzip"
+	}
+
+	if s.EnableInlineLaTeX == nil {
+		s.EnableInlineLaTeX = NewBool(false)
 	}
 
 	if s.EnableCustomEmoji == nil {

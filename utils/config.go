@@ -565,6 +565,7 @@ func GenerateClientConfig(c *model.Config, diagnosticId string, license *model.L
 	props["AvailableLocales"] = *c.LocalizationSettings.AvailableLocales
 	props["SQLDriverName"] = *c.SqlSettings.DriverName
 
+	props["EnableInlineLaTeX"] = strconv.FormatBool(*c.ServiceSettings.EnableInlineLaTeX)
 	props["EnableCustomEmoji"] = strconv.FormatBool(*c.ServiceSettings.EnableCustomEmoji)
 	props["EnableEmojiPicker"] = strconv.FormatBool(*c.ServiceSettings.EnableEmojiPicker)
 	props["RestrictCustomEmojiCreation"] = *c.ServiceSettings.RestrictCustomEmojiCreation
