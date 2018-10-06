@@ -4,10 +4,11 @@
 package app
 
 import (
+	"net/http"
 	"reflect"
+	"strings"
 
 	"github.com/mattermost/mattermost-server/model"
-	"net/http"
 )
 
 func (a *App) GetRole(id string) (*model.Role, *model.AppError) {
@@ -49,6 +50,21 @@ func (a *App) PatchRole(role *model.Role, patch *model.RolePatch) (*model.Role, 
 	return role, err
 }
 
+func (a *App) CreateRole(role *model.Role) (*model.Role, *model.AppError) {
+	role.Id = ""
+	role.CreateAt = 0
+	role.UpdateAt = 0
+	role.DeleteAt = 0
+	role.BuiltIn = false
+	role.SchemeManaged = false
+
+	if result := <-a.Srv.Store.Role().Save(role); result.Err != nil {
+		return nil, result.Err
+	} else {
+		return result.Data.(*model.Role), nil
+	}
+}
+
 func (a *App) UpdateRole(role *model.Role) (*model.Role, *model.AppError) {
 	if result := <-a.Srv.Store.Role().Save(role); result.Err != nil {
 		return nil, result.Err
@@ -88,4 +104,24 @@ func (a *App) sendUpdatedRoleEvent(role *model.Role) {
 	a.Go(func() {
 		a.Publish(message)
 	})
+}
+
+func RemoveRoles(rolesToRemove []string, roles string) string {
+	roleList := strings.Fields(roles)
+	newRoles := make([]string, 0)
+
+	for _, role := range roleList {
+		shouldRemove := false
+		for _, roleToRemove := range rolesToRemove {
+			if role == roleToRemove {
+				shouldRemove = true
+				break
+			}
+		}
+		if !shouldRemove {
+			newRoles = append(newRoles, role)
+		}
+	}
+
+	return strings.Join(newRoles, " ")
 }

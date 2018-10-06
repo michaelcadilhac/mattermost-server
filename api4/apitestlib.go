@@ -19,13 +19,14 @@ import (
 	"testing"
 	"time"
 
-	l4g "github.com/alecthomas/log4go"
 	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/store/sqlstore"
 	"github.com/mattermost/mattermost-server/store/storetest"
 	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/web"
 	"github.com/mattermost/mattermost-server/wsapi"
 
 	s3 "github.com/minio/minio-go"
@@ -43,11 +44,13 @@ type TestHelper struct {
 	BasicTeam           *model.Team
 	BasicChannel        *model.Channel
 	BasicPrivateChannel *model.Channel
+	BasicDeletedChannel *model.Channel
 	BasicChannel2       *model.Channel
 	BasicPost           *model.Post
 
 	SystemAdminClient *model.Client4
 	SystemAdminUser   *model.User
+	tempWorkspace     string
 }
 
 type persistentTestStore struct {
@@ -73,7 +76,7 @@ func StopTestStore() {
 	}
 }
 
-func setupTestHelper(enterprise bool) *TestHelper {
+func setupTestHelper(enterprise bool, updateConfig func(*model.Config)) *TestHelper {
 	permConfig, err := os.Open(utils.FindConfigFile("config.json"))
 	if err != nil {
 		panic(err)
@@ -113,16 +116,21 @@ func setupTestHelper(enterprise bool) *TestHelper {
 	if testStore != nil {
 		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.ListenAddress = ":0" })
 	}
+	if updateConfig != nil {
+		th.App.UpdateConfig(updateConfig)
+	}
 	serverErr := th.App.StartServer()
 	if serverErr != nil {
 		panic(serverErr)
 	}
 
 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.ListenAddress = prevListenAddress })
-	Init(th.App, th.App.Srv.Router, true)
+	Init(th.App, th.App.Srv.Router)
+	web.NewWeb(th.App, th.App.Srv.Router)
 	wsapi.Init(th.App, th.App.Srv.WebSocketRouter)
 	th.App.Srv.Store.MarkSystemRanUnitTests()
 	th.App.DoAdvancedPermissionsMigration()
+	th.App.DoEmojisPermissionsMigration()
 
 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.TeamSettings.EnableOpenServer = true })
 
@@ -134,15 +142,38 @@ func setupTestHelper(enterprise bool) *TestHelper {
 
 	th.Client = th.CreateClient()
 	th.SystemAdminClient = th.CreateClient()
+
+	if th.tempWorkspace == "" {
+		dir, err := ioutil.TempDir("", "apptest")
+		if err != nil {
+			panic(err)
+		}
+		th.tempWorkspace = dir
+	}
+
+	pluginDir := filepath.Join(th.tempWorkspace, "plugins")
+	webappDir := filepath.Join(th.tempWorkspace, "webapp")
+
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.PluginSettings.Directory = pluginDir
+		*cfg.PluginSettings.ClientDirectory = webappDir
+	})
+
+	th.App.InitPlugins(pluginDir, webappDir)
+
 	return th
 }
 
 func SetupEnterprise() *TestHelper {
-	return setupTestHelper(true)
+	return setupTestHelper(true, nil)
 }
 
 func Setup() *TestHelper {
-	return setupTestHelper(false)
+	return setupTestHelper(false, nil)
+}
+
+func SetupConfig(updateConfig func(cfg *model.Config)) *TestHelper {
+	return setupTestHelper(false, updateConfig)
 }
 
 func (me *TestHelper) TearDown() {
@@ -156,13 +187,13 @@ func (me *TestHelper) TearDown() {
 		options := map[string]bool{}
 		options[store.USER_SEARCH_OPTION_NAMES_ONLY_NO_FULL_NAME] = true
 		if result := <-me.App.Srv.Store.User().Search("", "fakeuser", options); result.Err != nil {
-			l4g.Error("Error tearing down test users")
+			mlog.Error("Error tearing down test users")
 		} else {
 			users := result.Data.([]*model.User)
 
 			for _, u := range users {
 				if err := me.App.PermanentDeleteUser(u); err != nil {
-					l4g.Error(err.Error())
+					mlog.Error(err.Error())
 				}
 			}
 		}
@@ -171,13 +202,13 @@ func (me *TestHelper) TearDown() {
 	go func() {
 		defer wg.Done()
 		if result := <-me.App.Srv.Store.Team().SearchByName("faketeam"); result.Err != nil {
-			l4g.Error("Error tearing down test teams")
+			mlog.Error("Error tearing down test teams")
 		} else {
 			teams := result.Data.([]*model.Team)
 
 			for _, t := range teams {
 				if err := me.App.PermanentDeleteTeam(t); err != nil {
-					l4g.Error(err.Error())
+					mlog.Error(err.Error())
 				}
 			}
 		}
@@ -186,7 +217,7 @@ func (me *TestHelper) TearDown() {
 	go func() {
 		defer wg.Done()
 		if result := <-me.App.Srv.Store.OAuth().GetApps(0, 1000); result.Err != nil {
-			l4g.Error("Error tearing down test oauth apps")
+			mlog.Error("Error tearing down test oauth apps")
 		} else {
 			apps := result.Data.([]*model.OAuthApp)
 
@@ -220,6 +251,7 @@ func (me *TestHelper) InitBasic() *TestHelper {
 	me.BasicTeam = me.CreateTeam()
 	me.BasicChannel = me.CreatePublicChannel()
 	me.BasicPrivateChannel = me.CreatePrivateChannel()
+	me.BasicDeletedChannel = me.CreatePublicChannel()
 	me.BasicChannel2 = me.CreatePublicChannel()
 	me.BasicPost = me.CreatePost()
 	me.BasicUser = me.CreateUser()
@@ -232,7 +264,10 @@ func (me *TestHelper) InitBasic() *TestHelper {
 	me.App.AddUserToChannel(me.BasicUser2, me.BasicChannel2)
 	me.App.AddUserToChannel(me.BasicUser, me.BasicPrivateChannel)
 	me.App.AddUserToChannel(me.BasicUser2, me.BasicPrivateChannel)
+	me.App.AddUserToChannel(me.BasicUser, me.BasicDeletedChannel)
+	me.App.AddUserToChannel(me.BasicUser2, me.BasicDeletedChannel)
 	me.App.UpdateUserRoles(me.BasicUser.Id, model.SYSTEM_USER_ROLE_ID, false)
+	me.Client.DeleteChannel(me.BasicDeletedChannel.Id)
 	me.LoginBasic()
 
 	return me
@@ -266,6 +301,10 @@ func (me *TestHelper) CreateClient() *model.Client4 {
 
 func (me *TestHelper) CreateWebSocketClient() (*model.WebSocketClient, *model.AppError) {
 	return model.NewWebSocketClient4(fmt.Sprintf("ws://localhost:%v", me.App.Srv.ListenAddr.Port), me.Client.AuthToken)
+}
+
+func (me *TestHelper) CreateWebSocketSystemAdminClient() (*model.WebSocketClient, *model.AppError) {
+	return model.NewWebSocketClient4(fmt.Sprintf("ws://localhost:%v", me.App.Srv.ListenAddr.Port), me.SystemAdminClient.AuthToken)
 }
 
 func (me *TestHelper) CreateUser() *model.User {
@@ -405,6 +444,31 @@ func (me *TestHelper) CreateMessagePostWithClient(client *model.Client4, channel
 	return rpost
 }
 
+func (me *TestHelper) CreateMessagePostNoClient(channel *model.Channel, message string, createAtTime int64) *model.Post {
+	post := store.Must(me.App.Srv.Store.Post().Save(&model.Post{
+		UserId:    me.BasicUser.Id,
+		ChannelId: channel.Id,
+		Message:   message,
+		CreateAt:  createAtTime,
+	})).(*model.Post)
+
+	return post
+}
+
+func (me *TestHelper) CreateDmChannel(user *model.User) *model.Channel {
+	utils.DisableDebugLogForTest()
+	var err *model.AppError
+	var channel *model.Channel
+	if channel, err = me.App.CreateDirectChannel(me.BasicUser.Id, user.Id); err != nil {
+		mlog.Error(err.Error())
+
+		time.Sleep(time.Second)
+		panic(err)
+	}
+	utils.EnableDebugLogForTest()
+	return channel
+}
+
 func (me *TestHelper) LoginBasic() {
 	me.LoginBasicWithClient(me.Client)
 }
@@ -450,8 +514,8 @@ func (me *TestHelper) UpdateActiveUser(user *model.User, active bool) {
 
 	_, err := me.App.UpdateActive(user, active)
 	if err != nil {
-		l4g.Error(err.Error())
-		l4g.Close()
+		mlog.Error(err.Error())
+
 		time.Sleep(time.Second)
 		panic(err)
 	}
@@ -464,8 +528,8 @@ func (me *TestHelper) LinkUserToTeam(user *model.User, team *model.Team) {
 
 	err := me.App.JoinUserToTeam(team, user, "")
 	if err != nil {
-		l4g.Error(err.Error())
-		l4g.Close()
+		mlog.Error(err.Error())
+
 		time.Sleep(time.Second)
 		panic(err)
 	}
@@ -478,8 +542,8 @@ func (me *TestHelper) AddUserToChannel(user *model.User, channel *model.Channel)
 
 	member, err := me.App.AddUserToChannel(user, channel)
 	if err != nil {
-		l4g.Error(err.Error())
-		l4g.Close()
+		mlog.Error(err.Error())
+
 		time.Sleep(time.Second)
 		panic(err)
 	}
@@ -765,7 +829,7 @@ func (me *TestHelper) MakeUserChannelAdmin(user *model.User, channel *model.Chan
 
 	if cmr := <-me.App.Srv.Store.Channel().GetMember(channel.Id, user.Id); cmr.Err == nil {
 		cm := cmr.Data.(*model.ChannelMember)
-		cm.Roles = "channel_admin channel_user"
+		cm.SchemeAdmin = true
 		if sr := <-me.App.Srv.Store.Channel().UpdateMember(cm); sr.Err != nil {
 			utils.EnableDebugLogForTest()
 			panic(sr.Err)
@@ -781,28 +845,42 @@ func (me *TestHelper) MakeUserChannelAdmin(user *model.User, channel *model.Chan
 func (me *TestHelper) UpdateUserToTeamAdmin(user *model.User, team *model.Team) {
 	utils.DisableDebugLogForTest()
 
-	tm := &model.TeamMember{TeamId: team.Id, UserId: user.Id, Roles: model.TEAM_USER_ROLE_ID + " " + model.TEAM_ADMIN_ROLE_ID}
-	if tmr := <-me.App.Srv.Store.Team().UpdateMember(tm); tmr.Err != nil {
+	if tmr := <-me.App.Srv.Store.Team().GetMember(team.Id, user.Id); tmr.Err == nil {
+		tm := tmr.Data.(*model.TeamMember)
+		tm.SchemeAdmin = true
+		if sr := <-me.App.Srv.Store.Team().UpdateMember(tm); sr.Err != nil {
+			utils.EnableDebugLogForTest()
+			panic(sr.Err)
+		}
+	} else {
 		utils.EnableDebugLogForTest()
-		l4g.Error(tmr.Err.Error())
-		l4g.Close()
+		mlog.Error(tmr.Err.Error())
+
 		time.Sleep(time.Second)
 		panic(tmr.Err)
 	}
+
 	utils.EnableDebugLogForTest()
 }
 
 func (me *TestHelper) UpdateUserToNonTeamAdmin(user *model.User, team *model.Team) {
 	utils.DisableDebugLogForTest()
 
-	tm := &model.TeamMember{TeamId: team.Id, UserId: user.Id, Roles: model.TEAM_USER_ROLE_ID}
-	if tmr := <-me.App.Srv.Store.Team().UpdateMember(tm); tmr.Err != nil {
+	if tmr := <-me.App.Srv.Store.Team().GetMember(team.Id, user.Id); tmr.Err == nil {
+		tm := tmr.Data.(*model.TeamMember)
+		tm.SchemeAdmin = false
+		if sr := <-me.App.Srv.Store.Team().UpdateMember(tm); sr.Err != nil {
+			utils.EnableDebugLogForTest()
+			panic(sr.Err)
+		}
+	} else {
 		utils.EnableDebugLogForTest()
-		l4g.Error(tmr.Err.Error())
-		l4g.Close()
+		mlog.Error(tmr.Err.Error())
+
 		time.Sleep(time.Second)
 		panic(tmr.Err)
 	}
+
 	utils.EnableDebugLogForTest()
 }
 

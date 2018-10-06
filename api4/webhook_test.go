@@ -4,8 +4,6 @@
 package api4
 
 import (
-	"bytes"
-	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -258,7 +256,7 @@ func TestCreateOutgoingWebhook(t *testing.T) {
 	th.AddPermissionToRole(model.PERMISSION_MANAGE_WEBHOOKS.Id, model.TEAM_ADMIN_ROLE_ID)
 	th.RemovePermissionFromRole(model.PERMISSION_MANAGE_WEBHOOKS.Id, model.TEAM_USER_ROLE_ID)
 
-	hook := &model.OutgoingWebhook{ChannelId: th.BasicChannel.Id, TeamId: th.BasicChannel.TeamId, CallbackURLs: []string{"http://nowhere.com"}}
+	hook := &model.OutgoingWebhook{ChannelId: th.BasicChannel.Id, TeamId: th.BasicChannel.TeamId, CallbackURLs: []string{"http://nowhere.com"}, Username: "some-user-name", IconURL: "http://some-icon-url/"}
 
 	rhook, resp := th.SystemAdminClient.CreateOutgoingWebhook(hook)
 	CheckNoError(t, resp)
@@ -367,7 +365,7 @@ func TestGetOutgoingWebhooks(t *testing.T) {
 		t.Fatal("missing hook")
 	}
 
-	hooks, resp = th.SystemAdminClient.GetOutgoingWebhooksForChannel(model.NewId(), 0, 1000, "")
+	_, resp = th.SystemAdminClient.GetOutgoingWebhooksForChannel(model.NewId(), 0, 1000, "")
 	CheckForbiddenStatus(t, resp)
 
 	_, resp = Client.GetOutgoingWebhooks(0, 1000, "")
@@ -891,47 +889,4 @@ func TestDeleteOutgoingHook(t *testing.T) {
 		_, resp = Client.DeleteOutgoingWebhook(rhook.Id)
 		CheckForbiddenStatus(t, resp)
 	})
-}
-
-func TestCommandWebhooks(t *testing.T) {
-	th := Setup().InitBasic().InitSystemAdmin()
-	defer th.TearDown()
-
-	Client := th.SystemAdminClient
-
-	cmd := &model.Command{
-		CreatorId: th.BasicUser.Id,
-		TeamId:    th.BasicTeam.Id,
-		URL:       "http://nowhere.com",
-		Method:    model.COMMAND_METHOD_POST,
-		Trigger:   "delayed"}
-
-	cmd, _ = Client.CreateCommand(cmd)
-	args := &model.CommandArgs{
-		TeamId:    th.BasicTeam.Id,
-		UserId:    th.BasicUser.Id,
-		ChannelId: th.BasicChannel.Id,
-	}
-	hook, err := th.App.CreateCommandWebhook(cmd.Id, args)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if resp, _ := http.Post(Client.Url+"/hooks/commands/123123123123", "application/json", bytes.NewBufferString(`{"text":"this is a test"}`)); resp.StatusCode != http.StatusNotFound {
-		t.Fatal("expected not-found for non-existent hook")
-	}
-
-	if resp, err := http.Post(Client.Url+"/hooks/commands/"+hook.Id, "application/json", bytes.NewBufferString(`{"text":"invalid`)); err != nil || resp.StatusCode != http.StatusBadRequest {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 5; i++ {
-		if resp, err := http.Post(Client.Url+"/hooks/commands/"+hook.Id, "application/json", bytes.NewBufferString(`{"text":"this is a test"}`)); err != nil || resp.StatusCode != http.StatusOK {
-			t.Fatal(err)
-		}
-	}
-
-	if resp, _ := http.Post(Client.Url+"/hooks/commands/"+hook.Id, "application/json", bytes.NewBufferString(`{"text":"this is a test"}`)); resp.StatusCode != http.StatusBadRequest {
-		t.Fatal("expected error for sixth usage")
-	}
 }

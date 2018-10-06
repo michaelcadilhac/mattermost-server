@@ -436,3 +436,128 @@ func TestMessageExportSetDefaultsExportDisabledExportFromTimestampNonZero(t *tes
 	require.Equal(t, int64(0), *mes.ExportFromTimestamp)
 	require.Equal(t, 10000, *mes.BatchSize)
 }
+
+func TestDisplaySettingsIsValidCustomUrlSchemes(t *testing.T) {
+	tests := []struct {
+		name  string
+		value []string
+		valid bool
+	}{
+		{
+			name:  "empty",
+			value: []string{},
+			valid: true,
+		},
+		{
+			name:  "custom protocol",
+			value: []string{"steam"},
+			valid: true,
+		},
+		{
+			name:  "multiple custom protocols",
+			value: []string{"bitcoin", "rss", "redis"},
+			valid: true,
+		},
+		{
+			name:  "containing numbers",
+			value: []string{"ut2004", "ts3server", "h323"},
+			valid: true,
+		},
+		{
+			name:  "containing period",
+			value: []string{"iris.beep"},
+			valid: false, // should technically be true, but client doesn't support it
+		},
+		{
+			name:  "containing hyphen",
+			value: []string{"ms-excel"},
+			valid: true,
+		},
+		{
+			name:  "containing plus",
+			value: []string{"coap+tcp", "coap+ws"},
+			valid: false, // should technically be true, but client doesn't support it
+		},
+		{
+			name:  "starting with number",
+			value: []string{"4four"},
+			valid: false,
+		},
+		{
+			name:  "starting with period",
+			value: []string{"data", ".dot"},
+			valid: false,
+		},
+		{
+			name:  "starting with hyphen",
+			value: []string{"-hyphen", "dns"},
+			valid: false,
+		},
+		{
+			name:  "invalid symbols",
+			value: []string{"!!fun!!"},
+			valid: false,
+		},
+		{
+			name:  "invalid letters",
+			value: []string{"école"},
+			valid: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ds := &DisplaySettings{}
+			ds.SetDefaults()
+
+			ds.CustomUrlSchemes = &test.value
+
+			if err := ds.isValid(); err != nil && test.valid {
+				t.Error("Expected CustomUrlSchemes to be valid but got error:", err)
+			} else if err == nil && !test.valid {
+				t.Error("Expected CustomUrlSchemes to be invalid but got no error")
+			}
+		})
+	}
+}
+
+func TestListenAddressIsValidated(t *testing.T) {
+
+	testValues := map[string]bool{
+		":8065":                true,
+		":9917":                true,
+		"0.0.0.0:9917":         true,
+		"[2001:db8::68]:9918":  true,
+		"[::1]:8065":           true,
+		"localhost:8065":       true,
+		"test.com:8065":        true,
+		":0":                   true,
+		":33147":               true,
+		"123:8065":             false,
+		"[::1]:99999":          false,
+		"[::1]:-1":             false,
+		"[::1]:8065a":          false,
+		"0.0.0:9917":           false,
+		"0.0.0.0:9917/":        false,
+		"0..0.0:9917/":         false,
+		"0.0.0222.0:9917/":     false,
+		"http://0.0.0.0:9917/": false,
+		"http://0.0.0.0:9917":  false,
+		"8065":                 false,
+		"[2001:db8::68]":       false,
+	}
+
+	for key, expected := range testValues {
+		ss := &ServiceSettings{
+			ListenAddress: NewString(key),
+		}
+		ss.SetDefaults()
+		if expected {
+			require.Nil(t, ss.isValid(), fmt.Sprintf("Got an error from '%v'.", key))
+		} else {
+			err := ss.isValid()
+			require.NotNil(t, err, fmt.Sprintf("Expected '%v' to throw an error.", key))
+			require.Equal(t, "model.config.is_valid.listen_address.app_error", err.Message)
+		}
+	}
+
+}

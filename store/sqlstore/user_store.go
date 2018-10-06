@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mattermost/gorp"
+
 	"github.com/mattermost/mattermost-server/einterfaces"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/store"
@@ -210,6 +212,16 @@ func (us SqlUserStore) UpdateLastPictureUpdate(userId string) store.StoreChannel
 	})
 }
 
+func (us SqlUserStore) ResetLastPictureUpdate(userId string) store.StoreChannel {
+	return store.Do(func(result *store.StoreResult) {
+		if _, err := us.GetMaster().Exec("UPDATE Users SET LastPictureUpdate = :Time, UpdateAt = :Time WHERE Id = :UserId", map[string]interface{}{"Time": 0, "UserId": userId}); err != nil {
+			result.Err = model.NewAppError("SqlUserStore.UpdateUpdateAt", "store.sql_user.update_last_picture_update.app_error", nil, "user_id="+userId, http.StatusInternalServerError)
+		} else {
+			result.Data = userId
+		}
+	})
+}
+
 func (us SqlUserStore) UpdateUpdateAt(userId string) store.StoreChannel {
 	return store.Do(func(result *store.StoreResult) {
 		curTime := model.GetMillis()
@@ -324,6 +336,17 @@ func (us SqlUserStore) GetAll() store.StoreChannel {
 		var data []*model.User
 		if _, err := us.GetReplica().Select(&data, "SELECT * FROM Users"); err != nil {
 			result.Err = model.NewAppError("SqlUserStore.GetAll", "store.sql_user.get.app_error", nil, err.Error(), http.StatusInternalServerError)
+		}
+
+		result.Data = data
+	})
+}
+
+func (us SqlUserStore) GetAllAfter(limit int, afterId string) store.StoreChannel {
+	return store.Do(func(result *store.StoreResult) {
+		var data []*model.User
+		if _, err := us.GetReplica().Select(&data, "SELECT * FROM Users WHERE Id > :AfterId ORDER BY Id LIMIT :Limit", map[string]interface{}{"AfterId": afterId, "Limit": limit}); err != nil {
+			result.Err = model.NewAppError("SqlUserStore.GetAllAfter", "store.sql_user.get.app_error", nil, err.Error(), http.StatusInternalServerError)
 		}
 
 		result.Data = data
@@ -819,13 +842,12 @@ func (us SqlUserStore) GetByUsername(username string) store.StoreChannel {
 	})
 }
 
-func (us SqlUserStore) GetForLogin(loginId string, allowSignInWithUsername, allowSignInWithEmail, ldapEnabled bool) store.StoreChannel {
+func (us SqlUserStore) GetForLogin(loginId string, allowSignInWithUsername, allowSignInWithEmail bool) store.StoreChannel {
 	return store.Do(func(result *store.StoreResult) {
 		params := map[string]interface{}{
 			"LoginId":                 loginId,
 			"AllowSignInWithUsername": allowSignInWithUsername,
 			"AllowSignInWithEmail":    allowSignInWithEmail,
-			"LdapEnabled":             ldapEnabled,
 		}
 
 		users := []*model.User{}
@@ -837,8 +859,7 @@ func (us SqlUserStore) GetForLogin(loginId string, allowSignInWithUsername, allo
 				Users
 			WHERE
 				(:AllowSignInWithUsername AND Username = :LoginId)
-				OR (:AllowSignInWithEmail AND Email = :LoginId)
-				OR (:LdapEnabled AND AuthService = '`+model.USER_AUTH_SERVICE_LDAP+`' AND AuthData = :LoginId)`,
+				OR (:AllowSignInWithEmail AND Email = :LoginId)`,
 			params); err != nil {
 			result.Err = model.NewAppError("SqlUserStore.GetForLogin", "store.sql_user.get_for_login.app_error", nil, err.Error(), http.StatusInternalServerError)
 		} else if len(users) == 1 {
@@ -931,6 +952,16 @@ func (us SqlUserStore) GetUnreadCount(userId string) store.StoreChannel {
 func (us SqlUserStore) GetUnreadCountForChannel(userId string, channelId string) store.StoreChannel {
 	return store.Do(func(result *store.StoreResult) {
 		if count, err := us.GetReplica().SelectInt("SELECT SUM(CASE WHEN c.Type = 'D' THEN (c.TotalMsgCount - cm.MsgCount) ELSE cm.MentionCount END) FROM Channels c INNER JOIN ChannelMembers cm ON c.Id = :ChannelId AND cm.ChannelId = :ChannelId AND cm.UserId = :UserId", map[string]interface{}{"ChannelId": channelId, "UserId": userId}); err != nil {
+			result.Err = model.NewAppError("SqlUserStore.GetMentionCountForChannel", "store.sql_user.get_unread_count_for_channel.app_error", nil, err.Error(), http.StatusInternalServerError)
+		} else {
+			result.Data = count
+		}
+	})
+}
+
+func (us SqlUserStore) GetAnyUnreadPostCountForChannel(userId string, channelId string) store.StoreChannel {
+	return store.Do(func(result *store.StoreResult) {
+		if count, err := us.GetReplica().SelectInt("SELECT SUM(c.TotalMsgCount - cm.MsgCount) FROM Channels c INNER JOIN ChannelMembers cm ON c.Id = :ChannelId AND cm.ChannelId = :ChannelId AND cm.UserId = :UserId", map[string]interface{}{"ChannelId": channelId, "UserId": userId}); err != nil {
 			result.Err = model.NewAppError("SqlUserStore.GetMentionCountForChannel", "store.sql_user.get_unread_count_for_channel.app_error", nil, err.Error(), http.StatusInternalServerError)
 		} else {
 			result.Data = count
@@ -1247,5 +1278,83 @@ func (us SqlUserStore) GetEtagForProfilesNotInTeam(teamId string) store.StoreCha
 		} else {
 			result.Data = fmt.Sprintf("%v.%v", model.CurrentVersion, updateAt)
 		}
+	})
+}
+
+func (us SqlUserStore) ClearAllCustomRoleAssignments() store.StoreChannel {
+	return store.Do(func(result *store.StoreResult) {
+		builtInRoles := model.MakeDefaultRoles()
+		lastUserId := strings.Repeat("0", 26)
+
+		for {
+			var transaction *gorp.Transaction
+			var err error
+
+			if transaction, err = us.GetMaster().Begin(); err != nil {
+				result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.open_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			var users []*model.User
+			if _, err := transaction.Select(&users, "SELECT * from Users WHERE Id > :Id ORDER BY Id LIMIT 1000", map[string]interface{}{"Id": lastUserId}); err != nil {
+				if err2 := transaction.Rollback(); err2 != nil {
+					result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.rollback_transaction.app_error", nil, err2.Error(), http.StatusInternalServerError)
+					return
+				}
+				result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.select.app_error", nil, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			if len(users) == 0 {
+				break
+			}
+
+			for _, user := range users {
+				lastUserId = user.Id
+
+				var newRoles []string
+
+				for _, role := range strings.Fields(user.Roles) {
+					for name := range builtInRoles {
+						if name == role {
+							newRoles = append(newRoles, role)
+							break
+						}
+					}
+				}
+
+				newRolesString := strings.Join(newRoles, " ")
+				if newRolesString != user.Roles {
+					if _, err := transaction.Exec("UPDATE Users SET Roles = :Roles WHERE Id = :Id", map[string]interface{}{"Roles": newRolesString, "Id": user.Id}); err != nil {
+						if err2 := transaction.Rollback(); err2 != nil {
+							result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.rollback_transaction.app_error", nil, err2.Error(), http.StatusInternalServerError)
+							return
+						}
+						result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.update.app_error", nil, err.Error(), http.StatusInternalServerError)
+						return
+					}
+				}
+			}
+
+			if err := transaction.Commit(); err != nil {
+				if err2 := transaction.Rollback(); err2 != nil {
+					result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.rollback_transaction.app_error", nil, err2.Error(), http.StatusInternalServerError)
+					return
+				}
+				result.Err = model.NewAppError("SqlUserStore.ClearAllCustomRoleAssignments", "store.sql_user.clear_all_custom_role_assignments.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+	})
+}
+
+func (us SqlUserStore) InferSystemInstallDate() store.StoreChannel {
+	return store.Do(func(result *store.StoreResult) {
+		createAt, err := us.GetReplica().SelectInt("SELECT CreateAt FROM Users WHERE CreateAt IS NOT NULL ORDER BY CreateAt ASC LIMIT 1")
+		if err != nil {
+			result.Err = model.NewAppError("SqlUserStore.GetSystemInstallDate", "store.sql_user.get_system_install_date.app_error", nil, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result.Data = createAt
 	})
 }

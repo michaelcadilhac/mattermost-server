@@ -4,11 +4,14 @@
 package api4
 
 import (
+	"io"
+	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/mattermost/mattermost-server/app"
 	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/web"
 )
 
 const (
@@ -27,14 +30,10 @@ func (api *API) InitEmoji() {
 }
 
 func createEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
+	defer io.Copy(ioutil.Discard, r.Body)
+
 	if !*c.App.Config().ServiceSettings.EnableCustomEmoji {
 		c.Err = model.NewAppError("createEmoji", "api.emoji.disabled.app_error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if emojiInterface := c.App.Emoji; emojiInterface != nil &&
-		!emojiInterface.CanUserCreateEmoji(c.Session.Roles, c.Session.TeamMembers) {
-		c.Err = model.NewAppError("getEmoji", "api.emoji.disabled.app_error", nil, "user_id="+c.Session.UserId, http.StatusUnauthorized)
 		return
 	}
 
@@ -51,6 +50,28 @@ func createEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(app.MaxEmojiFileSize); err != nil {
 		c.Err = model.NewAppError("createEmoji", "api.emoji.create.parse.app_error", nil, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Allow any user with MANAGE_EMOJIS permission at Team level to manage emojis at system level
+	memberships, err := c.App.GetTeamMembersForUser(c.Session.UserId)
+
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if !c.App.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_EMOJIS) {
+		hasPermission := false
+		for _, membership := range memberships {
+			if c.App.SessionHasPermissionToTeam(c.Session, membership.TeamId, model.PERMISSION_MANAGE_EMOJIS) {
+				hasPermission = true
+				break
+			}
+		}
+		if !hasPermission {
+			c.SetPermissionError(model.PERMISSION_MANAGE_EMOJIS)
+			return
+		}
 	}
 
 	m := r.MultipartForm
@@ -71,9 +92,9 @@ func createEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(newEmoji.ToJson()))
 	}
+
+	w.Write([]byte(newEmoji.ToJson()))
 }
 
 func getEmojiList(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -92,9 +113,9 @@ func getEmojiList(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(model.EmojiListToJson(listEmoji)))
 	}
+
+	w.Write([]byte(model.EmojiListToJson(listEmoji)))
 }
 
 func deleteEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -109,18 +130,52 @@ func deleteEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if c.Session.UserId != emoji.CreatorId && !c.App.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_SYSTEM) {
-		c.Err = model.NewAppError("deleteImage", "api.emoji.delete.permissions.app_error", nil, "user_id="+c.Session.UserId, http.StatusUnauthorized)
+	// Allow any user with MANAGE_EMOJIS permission at Team level to manage emojis at system level
+	memberships, err := c.App.GetTeamMembersForUser(c.Session.UserId)
+
+	if err != nil {
+		c.Err = err
 		return
+	}
+
+	if !c.App.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_EMOJIS) {
+		hasPermission := false
+		for _, membership := range memberships {
+			if c.App.SessionHasPermissionToTeam(c.Session, membership.TeamId, model.PERMISSION_MANAGE_EMOJIS) {
+				hasPermission = true
+				break
+			}
+		}
+		if !hasPermission {
+			c.SetPermissionError(model.PERMISSION_MANAGE_EMOJIS)
+			return
+		}
+	}
+
+	if c.Session.UserId != emoji.CreatorId {
+		if !c.App.SessionHasPermissionTo(c.Session, model.PERMISSION_MANAGE_OTHERS_EMOJIS) {
+			hasPermission := false
+			for _, membership := range memberships {
+				if c.App.SessionHasPermissionToTeam(c.Session, membership.TeamId, model.PERMISSION_MANAGE_OTHERS_EMOJIS) {
+					hasPermission = true
+					break
+				}
+			}
+
+			if !hasPermission {
+				c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_EMOJIS)
+				return
+			}
+		}
 	}
 
 	err = c.App.DeleteEmoji(emoji)
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		ReturnStatusOK(w)
 	}
+
+	ReturnStatusOK(w)
 }
 
 func getEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -138,9 +193,9 @@ func getEmoji(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(emoji.ToJson()))
 	}
+
+	w.Write([]byte(emoji.ToJson()))
 }
 
 func getEmojiByName(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -153,9 +208,9 @@ func getEmojiByName(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(emoji.ToJson()))
 	}
+
+	w.Write([]byte(emoji.ToJson()))
 }
 
 func getEmojiImage(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -197,13 +252,13 @@ func searchEmojis(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	emojis, err := c.App.SearchEmoji(emojiSearch.Term, emojiSearch.PrefixOnly, PER_PAGE_MAXIMUM)
+	emojis, err := c.App.SearchEmoji(emojiSearch.Term, emojiSearch.PrefixOnly, web.PER_PAGE_MAXIMUM)
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(model.EmojiListToJson(emojis)))
 	}
+
+	w.Write([]byte(model.EmojiListToJson(emojis)))
 }
 
 func autocompleteEmojis(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -218,7 +273,7 @@ func autocompleteEmojis(c *Context, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.Err = err
 		return
-	} else {
-		w.Write([]byte(model.EmojiListToJson(emojis)))
 	}
+
+	w.Write([]byte(model.EmojiListToJson(emojis)))
 }

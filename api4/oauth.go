@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	l4g "github.com/alecthomas/log4go"
 	"github.com/mattermost/mattermost-server/app"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/utils"
 )
@@ -88,6 +88,12 @@ func updateOAuthApp(c *Context, w http.ResponseWriter, r *http.Request) {
 	oauthApp := model.OAuthAppFromJson(r.Body)
 	if oauthApp == nil {
 		c.SetInvalidParam("oauth_app")
+		return
+	}
+
+	// The app being updated in the payload must be the same one as indicated in the URL.
+	if oauthApp.Id != c.Params.AppId {
+		c.SetInvalidParam("app_id")
 		return
 	}
 
@@ -278,6 +284,12 @@ func authorizeOAuthApp(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if c.Session.IsOAuth {
+		c.SetPermissionError(model.PERMISSION_EDIT_OTHER_USERS)
+		c.Err.DetailedError += ", attempted access by oauth app"
+		return
+	}
+
 	c.LogAudit("attempt")
 
 	redirectUrl, err := c.App.AllowOAuthAppAccessToUser(c.Session.UserId, authRequest)
@@ -314,7 +326,7 @@ func deauthorizeOAuthApp(c *Context, w http.ResponseWriter, r *http.Request) {
 func authorizeOAuthPage(c *Context, w http.ResponseWriter, r *http.Request) {
 	if !c.App.Config().ServiceSettings.EnableOAuthServiceProvider {
 		err := model.NewAppError("authorizeOAuth", "api.oauth.authorize_oauth.disabled.app_error", nil, "", http.StatusNotImplemented)
-		utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+		utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		return
 	}
 
@@ -326,26 +338,32 @@ func authorizeOAuthPage(c *Context, w http.ResponseWriter, r *http.Request) {
 		State:        r.URL.Query().Get("state"),
 	}
 
+	loginHint := r.URL.Query().Get("login_hint")
+
 	if err := authRequest.IsValid(); err != nil {
-		utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+		utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		return
 	}
 
 	oauthApp, err := c.App.GetOAuthApp(authRequest.ClientId)
 	if err != nil {
-		utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+		utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		return
 	}
 
 	// here we should check if the user is logged in
 	if len(c.Session.UserId) == 0 {
-		http.Redirect(w, r, c.GetSiteURLHeader()+"/login?redirect_to="+url.QueryEscape(r.RequestURI), http.StatusFound)
+		if loginHint == model.USER_AUTH_SERVICE_SAML {
+			http.Redirect(w, r, c.GetSiteURLHeader()+"/login/sso/saml?redirect_to="+url.QueryEscape(r.RequestURI), http.StatusFound)
+		} else {
+			http.Redirect(w, r, c.GetSiteURLHeader()+"/login?redirect_to="+url.QueryEscape(r.RequestURI), http.StatusFound)
+		}
 		return
 	}
 
 	if !oauthApp.IsValidRedirectURL(authRequest.RedirectUri) {
 		err := model.NewAppError("authorizeOAuthPage", "api.oauth.allow_oauth.redirect_callback.app_error", nil, "", http.StatusBadRequest)
-		utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+		utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		return
 	}
 
@@ -358,11 +376,10 @@ func authorizeOAuthPage(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	// Automatically allow if the app is trusted
 	if oauthApp.IsTrusted || isAuthorized {
-		authRequest.ResponseType = model.AUTHCODE_RESPONSE_TYPE
 		redirectUrl, err := c.App.AllowOAuthAppAccessToUser(c.Session.UserId, authRequest)
 
 		if err != nil {
-			utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+			utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 			return
 		}
 
@@ -418,7 +435,7 @@ func getAccessToken(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	c.LogAudit("attempt")
 
-	accessRsp, err := c.App.GetOAuthAccessToken(clientId, grantType, redirectUri, code, secret, refreshToken)
+	accessRsp, err := c.App.GetOAuthAccessTokenForCodeFlow(clientId, grantType, redirectUri, code, secret, refreshToken)
 	if err != nil {
 		c.Err = err
 		return
@@ -441,9 +458,18 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	service := c.Params.Service
 
+	oauthError := r.URL.Query().Get("error")
+	if oauthError == "access_denied" {
+		utils.RenderWebError(c.App.Config(), w, r, http.StatusTemporaryRedirect, url.Values{
+			"type":    []string{"oauth_access_denied"},
+			"service": []string{strings.Title(service)},
+		}, c.App.AsymmetricSigningKey())
+		return
+	}
+
 	code := r.URL.Query().Get("code")
 	if len(code) == 0 {
-		utils.RenderWebError(w, r, http.StatusTemporaryRedirect, url.Values{
+		utils.RenderWebError(c.App.Config(), w, r, http.StatusTemporaryRedirect, url.Values{
 			"type":    []string{"oauth_missing_code"},
 			"service": []string{strings.Title(service)},
 		}, c.App.AsymmetricSigningKey())
@@ -463,11 +489,11 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		err.Translate(c.T)
-		l4g.Error(err.Error())
+		mlog.Error(err.Error())
 		if action == model.OAUTH_ACTION_MOBILE {
 			w.Write([]byte(err.ToJson()))
 		} else {
-			utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+			utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		}
 		return
 	}
@@ -475,11 +501,11 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 	user, err := c.App.CompleteOAuth(service, body, teamId, props)
 	if err != nil {
 		err.Translate(c.T)
-		l4g.Error(err.Error())
+		mlog.Error(err.Error())
 		if action == model.OAUTH_ACTION_MOBILE {
 			w.Write([]byte(err.ToJson()))
 		} else {
-			utils.RenderWebAppError(w, r, err, c.App.AsymmetricSigningKey())
+			utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		}
 		return
 	}
@@ -509,9 +535,9 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 	if action == model.OAUTH_ACTION_MOBILE {
 		ReturnStatusOK(w)
 		return
-	} else {
-		http.Redirect(w, r, redirectUrl, http.StatusTemporaryRedirect)
 	}
+
+	http.Redirect(w, r, redirectUrl, http.StatusTemporaryRedirect)
 }
 
 func loginWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -529,12 +555,13 @@ func loginWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if authUrl, err := c.App.GetOAuthLoginEndpoint(w, r, c.Params.Service, teamId, model.OAUTH_ACTION_LOGIN, redirectTo, loginHint); err != nil {
+	authUrl, err := c.App.GetOAuthLoginEndpoint(w, r, c.Params.Service, teamId, model.OAUTH_ACTION_LOGIN, redirectTo, loginHint)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		http.Redirect(w, r, authUrl, http.StatusFound)
 	}
+
+	http.Redirect(w, r, authUrl, http.StatusFound)
 }
 
 func mobileLoginWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -549,12 +576,13 @@ func mobileLoginWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if authUrl, err := c.App.GetOAuthLoginEndpoint(w, r, c.Params.Service, teamId, model.OAUTH_ACTION_MOBILE, "", ""); err != nil {
+	authUrl, err := c.App.GetOAuthLoginEndpoint(w, r, c.Params.Service, teamId, model.OAUTH_ACTION_MOBILE, "", "")
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		http.Redirect(w, r, authUrl, http.StatusFound)
 	}
+
+	http.Redirect(w, r, authUrl, http.StatusFound)
 }
 
 func signupWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -563,8 +591,8 @@ func signupWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !c.App.Config().TeamSettings.EnableUserCreation {
-		utils.RenderWebError(w, r, http.StatusBadRequest, url.Values{
+	if !*c.App.Config().TeamSettings.EnableUserCreation {
+		utils.RenderWebError(c.App.Config(), w, r, http.StatusBadRequest, url.Values{
 			"message": []string{utils.T("api.oauth.singup_with_oauth.disabled.app_error")},
 		}, c.App.AsymmetricSigningKey())
 		return
@@ -576,10 +604,11 @@ func signupWithOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if authUrl, err := c.App.GetOAuthSignupEndpoint(w, r, c.Params.Service, teamId); err != nil {
+	authUrl, err := c.App.GetOAuthSignupEndpoint(w, r, c.Params.Service, teamId)
+	if err != nil {
 		c.Err = err
 		return
-	} else {
-		http.Redirect(w, r, authUrl, http.StatusFound)
 	}
+
+	http.Redirect(w, r, authUrl, http.StatusFound)
 }

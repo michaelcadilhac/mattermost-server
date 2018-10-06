@@ -32,8 +32,8 @@ func newTestServer() (chan string, *httptest.Server) {
 
 func TestPluginSetting(t *testing.T) {
 	settings := &model.PluginSettings{
-		Plugins: map[string]interface{}{
-			"test": map[string]string{
+		Plugins: map[string]map[string]interface{}{
+			"test": map[string]interface{}{
 				"foo": "bar",
 			},
 		},
@@ -103,19 +103,13 @@ func TestDiagnostics(t *testing.T) {
 
 		info := ""
 		// Collect the info sent.
+	Loop:
 		for {
-			done := false
 			select {
 			case result := <-data:
 				info += result
 			case <-time.After(time.Second * 1):
-				// Done recieving
-				done = true
-				break
-			}
-
-			if done {
-				break
+				break Loop
 			}
 		}
 

@@ -5,25 +5,28 @@ package app
 
 import (
 	"fmt"
-	"html"
-	"html/template"
-	"net/http"
-	"net/url"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 
-	l4g "github.com/alecthomas/log4go"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/utils"
 	"github.com/mattermost/mattermost-server/utils/markdown"
-	"github.com/nicksnyder/go-i18n/i18n"
+)
+
+const (
+	THREAD_ANY  = "any"
+	THREAD_ROOT = "root"
 )
 
 func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *model.Channel, sender *model.User, parentPostList *model.PostList) ([]string, *model.AppError) {
+	// Do not send notifications in archived channels
+	if channel.DeleteAt > 0 {
+		return []string{}, nil
+	}
+
 	pchan := a.Srv.Store.User().GetAllProfilesInChannel(channel.Id, true)
 	cmnchan := a.Srv.Store.Channel().GetAllChannelMembersNotifyPropsForChannel(channel.Id, true)
 	var fchan store.StoreChannel
@@ -32,21 +35,20 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 		fchan = a.Srv.Store.FileInfo().GetForPost(post.Id, true, true)
 	}
 
-	var profileMap map[string]*model.User
-	if result := <-pchan; result.Err != nil {
+	result := <-pchan
+	if result.Err != nil {
 		return nil, result.Err
-	} else {
-		profileMap = result.Data.(map[string]*model.User)
 	}
+	profileMap := result.Data.(map[string]*model.User)
 
-	var channelMemberNotifyPropsMap map[string]model.StringMap
-	if result := <-cmnchan; result.Err != nil {
+	result = <-cmnchan
+	if result.Err != nil {
 		return nil, result.Err
-	} else {
-		channelMemberNotifyPropsMap = result.Data.(map[string]model.StringMap)
 	}
+	channelMemberNotifyPropsMap := result.Data.(map[string]model.StringMap)
 
 	mentionedUserIds := make(map[string]bool)
+	threadMentionedUserIds := make(map[string]string)
 	allActivityPushUserIds := []string{}
 	hereNotification := false
 	channelNotification := false
@@ -88,7 +90,7 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 	} else {
 		keywords := a.GetMentionKeywordsInChannel(profileMap, post.Type != model.POST_HEADER_CHANGE && post.Type != model.POST_PURPOSE_CHANGE)
 
-		m := GetExplicitMentions(post.Message, keywords)
+		m := GetExplicitMentions(post, keywords)
 
 		// Add an implicit mention when a user is added to a channel
 		// even if the user has set 'username mentions' to false in account settings.
@@ -106,8 +108,16 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 		if len(post.RootId) > 0 && parentPostList != nil {
 			for _, threadPost := range parentPostList.Posts {
 				profile := profileMap[threadPost.UserId]
-				if profile != nil && (profile.NotifyProps["comments"] == "any" || (profile.NotifyProps["comments"] == "root" && threadPost.Id == parentPostList.Order[0])) {
-					mentionedUserIds[threadPost.UserId] = true
+				if profile != nil && (profile.NotifyProps["comments"] == THREAD_ANY || (profile.NotifyProps["comments"] == THREAD_ROOT && threadPost.Id == parentPostList.Order[0])) {
+					if threadPost.Id == parentPostList.Order[0] {
+						threadMentionedUserIds[threadPost.UserId] = THREAD_ROOT
+					} else {
+						threadMentionedUserIds[threadPost.UserId] = THREAD_ANY
+					}
+
+					if _, ok := mentionedUserIds[threadPost.UserId]; !ok {
+						mentionedUserIds[threadPost.UserId] = false
+					}
 				}
 			}
 		}
@@ -145,36 +155,11 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 		updateMentionChans = append(updateMentionChans, a.Srv.Store.Channel().IncrementMentionCount(post.ChannelId, id))
 	}
 
-	senderName := ""
-	channelName := ""
-	if post.IsSystemMessage() {
-		senderName = utils.T("system.message.name")
-	} else {
-		if value, ok := post.Props["override_username"]; ok && post.Props["from_webhook"] == "true" {
-			senderName = value.(string)
-		} else {
-			senderName = sender.Username
-		}
-	}
-
-	if channel.Type == model.CHANNEL_GROUP {
-		userList := []*model.User{}
-		for _, u := range profileMap {
-			if u.Id != sender.Id {
-				userList = append(userList, u)
-			}
-		}
-		userList = append(userList, sender)
-		channelName = model.GetGroupDisplayNameFromUsers(userList, false)
-	} else {
-		channelName = channel.DisplayName
-	}
-
-	var senderUsername string
-	if value, ok := post.Props["override_username"]; ok && post.Props["from_webhook"] == "true" {
-		senderUsername = value.(string)
-	} else {
-		senderUsername = sender.Username
+	notification := &postNotification{
+		post:       post,
+		channel:    channel,
+		profileMap: profileMap,
+		sender:     sender,
 	}
 
 	if a.Config().EmailSettings.SendEmailNotifications {
@@ -193,14 +178,14 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 			// Remove the user as recipient when the user has muted the channel.
 			if channelMuted, ok := channelMemberNotifyPropsMap[id][model.MARK_UNREAD_NOTIFY_PROP]; ok {
 				if channelMuted == model.CHANNEL_MARK_UNREAD_MENTION {
-					l4g.Debug("Channel muted for user_id %v, channel_mute %v", id, channelMuted)
+					mlog.Debug(fmt.Sprintf("Channel muted for user_id %v, channel_mute %v", id, channelMuted))
 					userAllowsEmails = false
 				}
 			}
 
 			//If email verification is required and user email is not verified don't send email.
 			if a.Config().EmailSettings.RequireEmailVerification && !profileMap[id].EmailVerified {
-				l4g.Error("Skipped sending notification email to %v, address not verified. [details: user_id=%v]", profileMap[id].Email, id)
+				mlog.Error(fmt.Sprintf("Skipped sending notification email to %v, address not verified. [details: user_id=%v]", profileMap[id].Email, id))
 				continue
 			}
 
@@ -216,8 +201,10 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 				}
 			}
 
-			if userAllowsEmails && status.Status != model.STATUS_ONLINE && profileMap[id].DeleteAt == 0 {
-				a.sendNotificationEmail(post, profileMap[id], channel, team, senderName, sender)
+			autoResponderRelated := status.Status == model.STATUS_OUT_OF_OFFICE || post.Type == model.POST_AUTO_RESPONDER
+
+			if userAllowsEmails && status.Status != model.STATUS_ONLINE && profileMap[id].DeleteAt == 0 && !autoResponderRelated {
+				a.sendNotificationEmail(notification, profileMap[id], team)
 			}
 		}
 	}
@@ -266,7 +253,7 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 	// MUST be completed before push notifications send
 	for _, uchan := range updateMentionChans {
 		if result := <-uchan; result.Err != nil {
-			l4g.Warn(utils.T("api.post.update_mention_count_and_forget.update_error"), post.Id, post.ChannelId, result.Err)
+			mlog.Warn(fmt.Sprintf("Failed to update mention count, post_id=%v channel_id=%v err=%v", post.Id, post.ChannelId, result.Err), mlog.String("post_id", post.Id))
 		}
 	}
 
@@ -274,7 +261,7 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 	if *a.Config().EmailSettings.SendPushNotifications {
 		pushServer := *a.Config().EmailSettings.PushNotificationServer
 		if license := a.License(); pushServer == model.MHPNS && (license == nil || !*license.Features.MHPNS) {
-			l4g.Warn(utils.T("api.post.send_notifications_and_forget.push_notification.mhpnsWarn"))
+			mlog.Warn("Push notifications are disabled. Go to System Console > Notifications > Mobile Push to enable them.")
 			sendPushNotifications = false
 		} else {
 			sendPushNotifications = true
@@ -294,7 +281,18 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 			}
 
 			if ShouldSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], true, status, post) {
-				a.sendPushNotification(post, profileMap[id], channel, senderName, channelName, true)
+				replyToThreadType := ""
+				if value, ok := threadMentionedUserIds[id]; ok {
+					replyToThreadType = value
+				}
+
+				a.sendPushNotification(
+					notification,
+					profileMap[id],
+					mentionedUserIds[id],
+					(channelNotification || hereNotification || allNotification),
+					replyToThreadType,
+				)
 			}
 		}
 
@@ -311,7 +309,13 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 				}
 
 				if ShouldSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], false, status, post) {
-					a.sendPushNotification(post, profileMap[id], channel, senderName, channelName, false)
+					a.sendPushNotification(
+						notification,
+						profileMap[id],
+						false,
+						false,
+						"",
+					)
 				}
 			}
 		}
@@ -320,9 +324,9 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 	message := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_POSTED, "", post.ChannelId, "", nil)
 	message.Add("post", a.PostWithProxyAddedToImageURLs(post).ToJson())
 	message.Add("channel_type", channel.Type)
-	message.Add("channel_display_name", channelName)
+	message.Add("channel_display_name", notification.GetChannelName(model.SHOW_USERNAME, ""))
 	message.Add("channel_name", channel.Name)
-	message.Add("sender_name", senderUsername)
+	message.Add("sender_name", notification.GetSenderName(model.SHOW_USERNAME, a.Config().ServiceSettings.EnablePostUsernameOverride))
 	message.Add("team_id", team.Id)
 
 	if len(post.FileIds) != 0 && fchan != nil {
@@ -330,7 +334,7 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 
 		var infos []*model.FileInfo
 		if result := <-fchan; result.Err != nil {
-			l4g.Warn(utils.T("api.post.send_notifications.files.error"), post.Id, result.Err)
+			mlog.Warn(fmt.Sprint("Unable to get fileInfo for push notifications.", post.Id, result.Err), mlog.String("post_id", post.Id))
 		} else {
 			infos = result.Data.([]*model.FileInfo)
 		}
@@ -349,444 +353,6 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 
 	a.Publish(message)
 	return mentionedUsersList, nil
-}
-
-func (a *App) sendNotificationEmail(post *model.Post, user *model.User, channel *model.Channel, team *model.Team, senderName string, sender *model.User) *model.AppError {
-	if channel.IsGroupOrDirect() {
-		if result := <-a.Srv.Store.Team().GetTeamsByUserId(user.Id); result.Err != nil {
-			return result.Err
-		} else {
-			// if the recipient isn't in the current user's team, just pick one
-			teams := result.Data.([]*model.Team)
-			found := false
-
-			for i := range teams {
-				if teams[i].Id == team.Id {
-					found = true
-					break
-				}
-			}
-
-			if !found && len(teams) > 0 {
-				team = teams[0]
-			} else {
-				// in case the user hasn't joined any teams we send them to the select_team page
-				team = &model.Team{Name: "select_team", DisplayName: a.Config().TeamSettings.SiteName}
-			}
-		}
-	}
-	if *a.Config().EmailSettings.EnableEmailBatching {
-		var sendBatched bool
-		if result := <-a.Srv.Store.Preference().Get(user.Id, model.PREFERENCE_CATEGORY_NOTIFICATIONS, model.PREFERENCE_NAME_EMAIL_INTERVAL); result.Err != nil {
-			// if the call fails, assume that the interval has not been explicitly set and batch the notifications
-			sendBatched = true
-		} else {
-			// if the user has chosen to receive notifications immediately, don't batch them
-			sendBatched = result.Data.(model.Preference).Value != model.PREFERENCE_EMAIL_INTERVAL_NO_BATCHING_SECONDS
-		}
-
-		if sendBatched {
-			if err := a.AddNotificationEmailToBatch(user, post, team); err == nil {
-				return nil
-			}
-		}
-
-		// fall back to sending a single email if we can't batch it for some reason
-	}
-
-	translateFunc := utils.GetUserTranslations(user.Locale)
-
-	var subjectText string
-	if channel.Type == model.CHANNEL_DIRECT {
-		subjectText = getDirectMessageNotificationEmailSubject(post, translateFunc, a.Config().TeamSettings.SiteName, senderName)
-	} else if *a.Config().EmailSettings.UseChannelInEmailNotifications {
-		subjectText = getNotificationEmailSubject(post, translateFunc, a.Config().TeamSettings.SiteName, team.DisplayName+" ("+channel.DisplayName+")")
-	} else {
-		subjectText = getNotificationEmailSubject(post, translateFunc, a.Config().TeamSettings.SiteName, team.DisplayName)
-	}
-
-	emailNotificationContentsType := model.EMAIL_NOTIFICATION_CONTENTS_FULL
-	if license := a.License(); license != nil && *license.Features.EmailNotificationContents {
-		emailNotificationContentsType = *a.Config().EmailSettings.EmailNotificationContentsType
-	}
-
-	teamURL := a.GetSiteURL() + "/" + team.Name
-	var bodyText = a.getNotificationEmailBody(user, post, channel, senderName, team.Name, teamURL, emailNotificationContentsType, translateFunc)
-
-	a.Go(func() {
-		if err := a.SendMail(user.Email, html.UnescapeString(subjectText), bodyText); err != nil {
-			l4g.Error(utils.T("api.post.send_notifications_and_forget.send.error"), user.Email, err)
-		}
-	})
-
-	if a.Metrics != nil {
-		a.Metrics.IncrementPostSentEmail()
-	}
-
-	return nil
-}
-
-/**
- * Computes the subject line for direct notification email messages
- */
-func getDirectMessageNotificationEmailSubject(post *model.Post, translateFunc i18n.TranslateFunc, siteName string, senderName string) string {
-	t := getFormattedPostTime(post, translateFunc)
-	var subjectParameters = map[string]interface{}{
-		"SiteName":          siteName,
-		"SenderDisplayName": senderName,
-		"Month":             t.Month,
-		"Day":               t.Day,
-		"Year":              t.Year,
-	}
-	return translateFunc("app.notification.subject.direct.full", subjectParameters)
-}
-
-/**
- * Computes the subject line for group, public, and private email messages
- */
-func getNotificationEmailSubject(post *model.Post, translateFunc i18n.TranslateFunc, siteName string, teamName string) string {
-	t := getFormattedPostTime(post, translateFunc)
-	var subjectParameters = map[string]interface{}{
-		"SiteName": siteName,
-		"TeamName": teamName,
-		"Month":    t.Month,
-		"Day":      t.Day,
-		"Year":     t.Year,
-	}
-	return translateFunc("app.notification.subject.notification.full", subjectParameters)
-}
-
-/**
- * Computes the email body for notification messages
- */
-func (a *App) getNotificationEmailBody(recipient *model.User, post *model.Post, channel *model.Channel, senderName string, teamName string, teamURL string, emailNotificationContentsType string, translateFunc i18n.TranslateFunc) string {
-	// only include message contents in notification email if email notification contents type is set to full
-	var bodyPage *utils.HTMLTemplate
-	if emailNotificationContentsType == model.EMAIL_NOTIFICATION_CONTENTS_FULL {
-		bodyPage = a.NewEmailTemplate("post_body_full", recipient.Locale)
-		bodyPage.Props["PostMessage"] = a.GetMessageForNotification(post, translateFunc)
-	} else {
-		bodyPage = a.NewEmailTemplate("post_body_generic", recipient.Locale)
-	}
-
-	bodyPage.Props["SiteURL"] = a.GetSiteURL()
-	if teamName != "select_team" {
-		bodyPage.Props["TeamLink"] = teamURL + "/pl/" + post.Id
-	} else {
-		bodyPage.Props["TeamLink"] = teamURL
-	}
-
-	var channelName = channel.DisplayName
-	if channel.Type == model.CHANNEL_GROUP {
-		channelName = translateFunc("api.templates.channel_name.group")
-	}
-	t := getFormattedPostTime(post, translateFunc)
-
-	var bodyText string
-	var info template.HTML
-	if channel.Type == model.CHANNEL_DIRECT {
-		if emailNotificationContentsType == model.EMAIL_NOTIFICATION_CONTENTS_FULL {
-			bodyText = translateFunc("app.notification.body.intro.direct.full")
-			info = utils.TranslateAsHtml(translateFunc, "app.notification.body.text.direct.full",
-				map[string]interface{}{
-					"SenderName": senderName,
-					"Hour":       t.Hour,
-					"Minute":     t.Minute,
-					"TimeZone":   t.TimeZone,
-					"Month":      t.Month,
-					"Day":        t.Day,
-				})
-		} else {
-			bodyText = translateFunc("app.notification.body.intro.direct.generic", map[string]interface{}{
-				"SenderName": senderName,
-			})
-			info = utils.TranslateAsHtml(translateFunc, "app.notification.body.text.direct.generic",
-				map[string]interface{}{
-					"Hour":     t.Hour,
-					"Minute":   t.Minute,
-					"TimeZone": t.TimeZone,
-					"Month":    t.Month,
-					"Day":      t.Day,
-				})
-		}
-	} else {
-		if emailNotificationContentsType == model.EMAIL_NOTIFICATION_CONTENTS_FULL {
-			bodyText = translateFunc("app.notification.body.intro.notification.full")
-			info = utils.TranslateAsHtml(translateFunc, "app.notification.body.text.notification.full",
-				map[string]interface{}{
-					"ChannelName": channelName,
-					"SenderName":  senderName,
-					"Hour":        t.Hour,
-					"Minute":      t.Minute,
-					"TimeZone":    t.TimeZone,
-					"Month":       t.Month,
-					"Day":         t.Day,
-				})
-		} else {
-			bodyText = translateFunc("app.notification.body.intro.notification.generic", map[string]interface{}{
-				"SenderName": senderName,
-			})
-			info = utils.TranslateAsHtml(translateFunc, "app.notification.body.text.notification.generic",
-				map[string]interface{}{
-					"Hour":     t.Hour,
-					"Minute":   t.Minute,
-					"TimeZone": t.TimeZone,
-					"Month":    t.Month,
-					"Day":      t.Day,
-				})
-		}
-	}
-
-	bodyPage.Props["BodyText"] = bodyText
-	bodyPage.Html["Info"] = info
-	bodyPage.Props["Button"] = translateFunc("api.templates.post_body.button")
-
-	return bodyPage.Render()
-}
-
-type formattedPostTime struct {
-	Time     time.Time
-	Year     string
-	Month    string
-	Day      string
-	Hour     string
-	Minute   string
-	TimeZone string
-}
-
-func getFormattedPostTime(post *model.Post, translateFunc i18n.TranslateFunc) formattedPostTime {
-	tm := time.Unix(post.CreateAt/1000, 0)
-	zone, _ := tm.Zone()
-
-	return formattedPostTime{
-		Time:     tm,
-		Year:     fmt.Sprintf("%d", tm.Year()),
-		Month:    translateFunc(tm.Month().String()),
-		Day:      fmt.Sprintf("%d", tm.Day()),
-		Hour:     fmt.Sprintf("%02d", tm.Hour()),
-		Minute:   fmt.Sprintf("%02d", tm.Minute()),
-		TimeZone: zone,
-	}
-}
-
-func (a *App) GetMessageForNotification(post *model.Post, translateFunc i18n.TranslateFunc) string {
-	if len(strings.TrimSpace(post.Message)) != 0 || len(post.FileIds) == 0 {
-		return post.Message
-	}
-
-	// extract the filenames from their paths and determine what type of files are attached
-	var infos []*model.FileInfo
-	if result := <-a.Srv.Store.FileInfo().GetForPost(post.Id, true, true); result.Err != nil {
-		l4g.Warn(utils.T("api.post.get_message_for_notification.get_files.error"), post.Id, result.Err)
-	} else {
-		infos = result.Data.([]*model.FileInfo)
-	}
-
-	filenames := make([]string, len(infos))
-	onlyImages := true
-	for i, info := range infos {
-		if escaped, err := url.QueryUnescape(filepath.Base(info.Name)); err != nil {
-			// this should never error since filepath was escaped using url.QueryEscape
-			filenames[i] = escaped
-		} else {
-			filenames[i] = info.Name
-		}
-
-		onlyImages = onlyImages && info.IsImage()
-	}
-
-	props := map[string]interface{}{"Filenames": strings.Join(filenames, ", ")}
-
-	if onlyImages {
-		return translateFunc("api.post.get_message_for_notification.images_sent", len(filenames), props)
-	} else {
-		return translateFunc("api.post.get_message_for_notification.files_sent", len(filenames), props)
-	}
-}
-
-func (a *App) sendPushNotification(post *model.Post, user *model.User, channel *model.Channel, senderName, channelName string, wasMentioned bool) *model.AppError {
-	sessions, err := a.getMobileAppSessions(user.Id)
-	if err != nil {
-		return err
-	}
-
-	if channel.Type == model.CHANNEL_DIRECT {
-		channelName = senderName
-	}
-
-	msg := model.PushNotification{}
-	if badge := <-a.Srv.Store.User().GetUnreadCount(user.Id); badge.Err != nil {
-		msg.Badge = 1
-		l4g.Error(utils.T("store.sql_user.get_unread_count.app_error"), user.Id, badge.Err)
-	} else {
-		msg.Badge = int(badge.Data.(int64))
-	}
-
-	msg.Type = model.PUSH_TYPE_MESSAGE
-	msg.TeamId = channel.TeamId
-	msg.ChannelId = channel.Id
-	msg.PostId = post.Id
-	msg.RootId = post.RootId
-	msg.ChannelName = channel.Name
-	msg.SenderId = post.UserId
-
-	if ou, ok := post.Props["override_username"].(string); ok {
-		msg.OverrideUsername = ou
-	}
-
-	if oi, ok := post.Props["override_icon_url"].(string); ok {
-		msg.OverrideIconUrl = oi
-	}
-
-	if fw, ok := post.Props["from_webhook"].(string); ok {
-		msg.FromWebhook = fw
-	}
-
-	userLocale := utils.GetUserTranslations(user.Locale)
-	hasFiles := post.FileIds != nil && len(post.FileIds) > 0
-
-	msg.Message, msg.Category = a.getPushNotificationMessage(post.Message, wasMentioned, hasFiles, senderName, channelName, channel.Type, userLocale)
-
-	for _, session := range sessions {
-		tmpMessage := *model.PushNotificationFromJson(strings.NewReader(msg.ToJson()))
-		tmpMessage.SetDeviceIdAndPlatform(session.DeviceId)
-
-		l4g.Debug("Sending push notification to device %v for user %v with msg of '%v'", tmpMessage.DeviceId, user.Id, msg.Message)
-
-		a.Go(func(session *model.Session) func() {
-			return func() {
-				a.sendToPushProxy(tmpMessage, session)
-			}
-		}(session))
-
-		if a.Metrics != nil {
-			a.Metrics.IncrementPostSentPush()
-		}
-	}
-
-	return nil
-}
-
-func (a *App) getPushNotificationMessage(postMessage string, wasMentioned bool, hasFiles bool, senderName string, channelName string, channelType string, userLocale i18n.TranslateFunc) (string, string) {
-	message := ""
-	category := ""
-
-	contentsConfig := *a.Config().EmailSettings.PushNotificationContents
-
-	if contentsConfig == model.FULL_NOTIFICATION {
-		category = model.CATEGORY_CAN_REPLY
-
-		if channelType == model.CHANNEL_DIRECT {
-			message = senderName + ": " + model.ClearMentionTags(postMessage)
-		} else {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_in") + channelName + ": " + model.ClearMentionTags(postMessage)
-		}
-	} else if contentsConfig == model.GENERIC_NO_CHANNEL_NOTIFICATION {
-		if channelType == model.CHANNEL_DIRECT {
-			category = model.CATEGORY_CAN_REPLY
-
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_message")
-		} else if wasMentioned {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_mention_no_channel")
-		} else {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_non_mention_no_channel")
-		}
-	} else {
-		if channelType == model.CHANNEL_DIRECT {
-			category = model.CATEGORY_CAN_REPLY
-
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_message")
-		} else if wasMentioned {
-			category = model.CATEGORY_CAN_REPLY
-
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_mention") + channelName
-		} else {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_non_mention") + channelName
-		}
-	}
-
-	// If the post only has images then push an appropriate message
-	if len(postMessage) == 0 && hasFiles {
-		if channelType == model.CHANNEL_DIRECT {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_image_only_dm")
-		} else if contentsConfig == model.GENERIC_NO_CHANNEL_NOTIFICATION {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_image_only_no_channel")
-		} else {
-			message = senderName + userLocale("api.post.send_notifications_and_forget.push_image_only") + channelName
-		}
-	}
-
-	return message, category
-}
-
-func (a *App) ClearPushNotification(userId string, channelId string) {
-	a.Go(func() {
-		// Sleep is to allow the read replicas a chance to fully sync
-		// the unread count for sending an accurate count.
-		// Delaying a little doesn't hurt anything and is cheaper than
-		// attempting to read from master.
-		time.Sleep(time.Second * 5)
-
-		sessions, err := a.getMobileAppSessions(userId)
-		if err != nil {
-			l4g.Error(err.Error())
-			return
-		}
-
-		msg := model.PushNotification{}
-		msg.Type = model.PUSH_TYPE_CLEAR
-		msg.ChannelId = channelId
-		msg.ContentAvailable = 0
-		if badge := <-a.Srv.Store.User().GetUnreadCount(userId); badge.Err != nil {
-			msg.Badge = 0
-			l4g.Error(utils.T("store.sql_user.get_unread_count.app_error"), userId, badge.Err)
-		} else {
-			msg.Badge = int(badge.Data.(int64))
-		}
-
-		l4g.Debug(utils.T("api.post.send_notifications_and_forget.clear_push_notification.debug"), msg.DeviceId, msg.ChannelId)
-
-		for _, session := range sessions {
-			tmpMessage := *model.PushNotificationFromJson(strings.NewReader(msg.ToJson()))
-			tmpMessage.SetDeviceIdAndPlatform(session.DeviceId)
-			a.Go(func() {
-				a.sendToPushProxy(tmpMessage, session)
-			})
-		}
-	})
-}
-
-func (a *App) sendToPushProxy(msg model.PushNotification, session *model.Session) {
-	msg.ServerId = a.DiagnosticId()
-
-	request, _ := http.NewRequest("POST", strings.TrimRight(*a.Config().EmailSettings.PushNotificationServer, "/")+model.API_URL_SUFFIX_V1+"/send_push", strings.NewReader(msg.ToJson()))
-
-	if resp, err := a.HTTPClient(true).Do(request); err != nil {
-		l4g.Error("Device push reported as error for UserId=%v SessionId=%v message=%v", session.UserId, session.Id, err.Error())
-	} else {
-		pushResponse := model.PushResponseFromJson(resp.Body)
-		if resp.Body != nil {
-			consumeAndClose(resp)
-		}
-
-		if pushResponse[model.PUSH_STATUS] == model.PUSH_STATUS_REMOVE {
-			l4g.Info("Device was reported as removed for UserId=%v SessionId=%v removing push for this session", session.UserId, session.Id)
-			a.AttachDeviceId(session.Id, "", session.ExpiresAt)
-			a.ClearSessionCacheForUser(session.UserId)
-		}
-
-		if pushResponse[model.PUSH_STATUS] == model.PUSH_STATUS_FAIL {
-			l4g.Error("Device push reported as error for UserId=%v SessionId=%v message=%v", session.UserId, session.Id, pushResponse[model.PUSH_STATUS_ERROR_MSG])
-		}
-	}
-}
-
-func (a *App) getMobileAppSessions(userId string) ([]*model.Session, *model.AppError) {
-	if result := <-a.Srv.Store.Session().GetSessionsWithActiveDeviceIds(userId); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.([]*model.Session), nil
-	}
 }
 
 func (a *App) sendOutOfChannelMentions(sender *model.User, post *model.Post, users []*model.User) *model.AppError {
@@ -863,7 +429,7 @@ type ExplicitMentions struct {
 
 // Given a message and a map mapping mention keywords to the users who use them, returns a map of mentioned
 // users and a slice of potential mention users not in the channel and whether or not @here was mentioned.
-func GetExplicitMentions(message string, keywords map[string][]string) *ExplicitMentions {
+func GetExplicitMentions(post *model.Post, keywords map[string][]string) *ExplicitMentions {
 	ret := &ExplicitMentions{
 		MentionedUserIds: make(map[string]bool),
 	}
@@ -913,22 +479,24 @@ func GetExplicitMentions(message string, keywords map[string][]string) *Explicit
 				continue
 			}
 
+			word = strings.TrimLeft(word, ":.-_")
+
 			if checkForMention(word) {
 				continue
 			}
 
-			// remove trailing '.', as that is the end of a sentence
-			foundWithSuffix := false
+			foundWithoutSuffix := false
+			wordWithoutSuffix := word
+			for strings.LastIndexAny(wordWithoutSuffix, ".-:_") != -1 {
+				wordWithoutSuffix = wordWithoutSuffix[0 : len(wordWithoutSuffix)-1]
 
-			for strings.HasSuffix(word, ".") {
-				word = strings.TrimSuffix(word, ".")
-				if checkForMention(word) {
-					foundWithSuffix = true
+				if checkForMention(wordWithoutSuffix) {
+					foundWithoutSuffix = true
 					break
 				}
 			}
 
-			if foundWithSuffix {
+			if foundWithoutSuffix {
 				continue
 			}
 
@@ -953,18 +521,39 @@ func GetExplicitMentions(message string, keywords map[string][]string) *Explicit
 	}
 
 	buf := ""
-	markdown.Inspect(message, func(node interface{}) bool {
-		text, ok := node.(*markdown.Text)
-		if !ok {
-			processText(buf)
-			buf = ""
-			return true
-		}
-		buf += text.Text
-		return false
-	})
+	mentionsEnabledFields := GetMentionsEnabledFields(post)
+	for _, message := range mentionsEnabledFields {
+		markdown.Inspect(message, func(node interface{}) bool {
+			text, ok := node.(*markdown.Text)
+			if !ok {
+				processText(buf)
+				buf = ""
+				return true
+			}
+			buf += text.Text
+			return false
+		})
+	}
 	processText(buf)
 
+	return ret
+}
+
+// Given a post returns the values of the fields in which mentions are possible.
+// post.message, preText and text in the attachment are enabled.
+func GetMentionsEnabledFields(post *model.Post) model.StringArray {
+	ret := []string{}
+
+	ret = append(ret, post.Message)
+	for _, attachment := range post.Attachments() {
+
+		if len(attachment.Pretext) != 0 {
+			ret = append(ret, attachment.Pretext)
+		}
+		if len(attachment.Text) != 0 {
+			ret = append(ret, attachment.Text)
+		}
+	}
 	return ret
 }
 
@@ -1009,65 +598,49 @@ func (a *App) GetMentionKeywordsInChannel(profiles map[string]*model.User, lookF
 	return keywords
 }
 
-func ShouldSendPushNotification(user *model.User, channelNotifyProps model.StringMap, wasMentioned bool, status *model.Status, post *model.Post) bool {
-	return DoesNotifyPropsAllowPushNotification(user, channelNotifyProps, post, wasMentioned) &&
-		DoesStatusAllowPushNotification(user.NotifyProps, status, post.ChannelId)
+// Represents either an email or push notification and contains the fields required to send it to any user.
+type postNotification struct {
+	channel    *model.Channel
+	post       *model.Post
+	profileMap map[string]*model.User
+	sender     *model.User
 }
 
-func DoesNotifyPropsAllowPushNotification(user *model.User, channelNotifyProps model.StringMap, post *model.Post, wasMentioned bool) bool {
-	userNotifyProps := user.NotifyProps
-	userNotify := userNotifyProps[model.PUSH_NOTIFY_PROP]
-	channelNotify, ok := channelNotifyProps[model.PUSH_NOTIFY_PROP]
+// Returns the name of the channel for this notification. For direct messages, this is the sender's name
+// preceeded by an at sign. For group messages, this is a comma-separated list of the members of the
+// channel, with an option to exclude the recipient of the message from that list.
+func (n *postNotification) GetChannelName(userNameFormat string, excludeId string) string {
+	switch n.channel.Type {
+	case model.CHANNEL_DIRECT:
+		return fmt.Sprintf("@%s", n.sender.GetDisplayName(userNameFormat))
+	case model.CHANNEL_GROUP:
+		names := []string{}
+		for _, user := range n.profileMap {
+			if user.Id != excludeId {
+				names = append(names, user.GetDisplayName(userNameFormat))
+			}
+		}
 
-	// If the channel is muted do not send push notifications
-	if channelMuted, ok := channelNotifyProps[model.MARK_UNREAD_NOTIFY_PROP]; ok {
-		if channelMuted == model.CHANNEL_MARK_UNREAD_MENTION {
-			return false
+		sort.Strings(names)
+
+		return strings.Join(names, ", ")
+	default:
+		return n.channel.DisplayName
+	}
+}
+
+// Returns the name of the sender of this notification, accounting for things like system messages
+// and whether or not the username has been overridden by an integration.
+func (n *postNotification) GetSenderName(userNameFormat string, overridesAllowed bool) string {
+	if n.post.IsSystemMessage() {
+		return utils.T("system.message.name")
+	}
+
+	if overridesAllowed && n.channel.Type != model.CHANNEL_DIRECT {
+		if value, ok := n.post.Props["override_username"]; ok && n.post.Props["from_webhook"] == "true" {
+			return value.(string)
 		}
 	}
 
-	if post.IsSystemMessage() {
-		return false
-	}
-
-	if channelNotify == model.USER_NOTIFY_NONE {
-		return false
-	}
-
-	if channelNotify == model.CHANNEL_NOTIFY_MENTION && !wasMentioned {
-		return false
-	}
-
-	if userNotify == model.USER_NOTIFY_MENTION && (!ok || channelNotify == model.CHANNEL_NOTIFY_DEFAULT) && !wasMentioned {
-		return false
-	}
-
-	if (userNotify == model.USER_NOTIFY_ALL || channelNotify == model.CHANNEL_NOTIFY_ALL) &&
-		(post.UserId != user.Id || post.Props["from_webhook"] == "true") {
-		return true
-	}
-
-	if userNotify == model.USER_NOTIFY_NONE &&
-		(!ok || channelNotify == model.CHANNEL_NOTIFY_DEFAULT) {
-		return false
-	}
-
-	return true
-}
-
-func DoesStatusAllowPushNotification(userNotifyProps model.StringMap, status *model.Status, channelId string) bool {
-	// If User status is DND or OOO return false right away
-	if status.Status == model.STATUS_DND || status.Status == model.STATUS_OUT_OF_OFFICE {
-		return false
-	}
-
-	if pushStatus, ok := userNotifyProps["push_status"]; (pushStatus == model.STATUS_ONLINE || !ok) && (status.ActiveChannel != channelId || model.GetMillis()-status.LastActivityAt > model.STATUS_CHANNEL_TIMEOUT) {
-		return true
-	} else if pushStatus == model.STATUS_AWAY && (status.Status == model.STATUS_AWAY || status.Status == model.STATUS_OFFLINE) {
-		return true
-	} else if pushStatus == model.STATUS_OFFLINE && status.Status == model.STATUS_OFFLINE {
-		return true
-	}
-
-	return false
+	return n.sender.GetDisplayName(userNameFormat)
 }

@@ -13,6 +13,33 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+)
+
+const (
+	HEADER_REQUEST_ID         = "X-Request-ID"
+	HEADER_VERSION_ID         = "X-Version-ID"
+	HEADER_CLUSTER_ID         = "X-Cluster-ID"
+	HEADER_ETAG_SERVER        = "ETag"
+	HEADER_ETAG_CLIENT        = "If-None-Match"
+	HEADER_FORWARDED          = "X-Forwarded-For"
+	HEADER_REAL_IP            = "X-Real-IP"
+	HEADER_FORWARDED_PROTO    = "X-Forwarded-Proto"
+	HEADER_TOKEN              = "token"
+	HEADER_BEARER             = "BEARER"
+	HEADER_AUTH               = "Authorization"
+	HEADER_REQUESTED_WITH     = "X-Requested-With"
+	HEADER_REQUESTED_WITH_XML = "XMLHttpRequest"
+	STATUS                    = "status"
+	STATUS_OK                 = "OK"
+	STATUS_FAIL               = "FAIL"
+	STATUS_REMOVE             = "REMOVE"
+
+	CLIENT_DIR = "client"
+
+	API_URL_SUFFIX_V1 = "/api/v1"
+	API_URL_SUFFIX_V4 = "/api/v4"
+	API_URL_SUFFIX    = API_URL_SUFFIX_V4
 )
 
 type Response struct {
@@ -30,10 +57,29 @@ type Client4 struct {
 	HttpClient *http.Client // The http client
 	AuthToken  string
 	AuthType   string
+	HttpHeader map[string]string // Headers to be copied over for each request
+}
+
+func closeBody(r *http.Response) {
+	if r.Body != nil {
+		ioutil.ReadAll(r.Body)
+		r.Body.Close()
+	}
+}
+
+// Must is a convenience function used for testing.
+func (c *Client4) Must(result interface{}, resp *Response) interface{} {
+	if resp.Error != nil {
+
+		time.Sleep(time.Second)
+		panic(resp.Error)
+	}
+
+	return result
 }
 
 func NewAPIv4Client(url string) *Client4 {
-	return &Client4{url, url + API_URL_SUFFIX, &http.Client{}, "", ""}
+	return &Client4{url, url + API_URL_SUFFIX, &http.Client{}, "", "", map[string]string{}}
 }
 
 func BuildErrorResponse(r *http.Response, err *AppError) *Response {
@@ -62,6 +108,11 @@ func BuildResponse(r *http.Response) *Response {
 		ServerVersion: r.Header.Get(HEADER_VERSION_ID),
 		Header:        r.Header,
 	}
+}
+
+func (c *Client4) MockSession(sessionToken string) {
+	c.AuthToken = sessionToken
+	c.AuthType = HEADER_BEARER
 }
 
 func (c *Client4) SetOAuthToken(token string) {
@@ -318,12 +369,44 @@ func (c *Client4) GetRolesRoute() string {
 	return fmt.Sprintf("/roles")
 }
 
+func (c *Client4) GetSchemesRoute() string {
+	return fmt.Sprintf("/schemes")
+}
+
+func (c *Client4) GetSchemeRoute(id string) string {
+	return c.GetSchemesRoute() + fmt.Sprintf("/%v", id)
+}
+
 func (c *Client4) GetAnalyticsRoute() string {
 	return fmt.Sprintf("/analytics")
 }
 
 func (c *Client4) GetTimezonesRoute() string {
 	return fmt.Sprintf(c.GetSystemRoute() + "/timezones")
+}
+
+func (c *Client4) GetChannelSchemeRoute(channelId string) string {
+	return fmt.Sprintf(c.GetChannelsRoute()+"/%v/scheme", channelId)
+}
+
+func (c *Client4) GetTeamSchemeRoute(teamId string) string {
+	return fmt.Sprintf(c.GetTeamsRoute()+"/%v/scheme", teamId)
+}
+
+func (c *Client4) GetTotalUsersStatsRoute() string {
+	return fmt.Sprintf(c.GetUsersRoute() + "/stats")
+}
+
+func (c *Client4) GetRedirectLocationRoute() string {
+	return fmt.Sprintf("/redirect_location")
+}
+
+func (c *Client4) GetRegisterServiceTermsRoute(userId string) string {
+	return c.GetUserRoute(userId) + "/terms_of_service"
+}
+
+func (c *Client4) GetServiceTermsRoute() string {
+	return "/terms_of_service"
 }
 
 func (c *Client4) DoApiGet(url string, etag string) (*http.Response, *AppError) {
@@ -344,7 +427,6 @@ func (c *Client4) DoApiDelete(url string) (*http.Response, *AppError) {
 
 func (c *Client4) DoApiRequest(method, url, data, etag string) (*http.Response, *AppError) {
 	rq, _ := http.NewRequest(method, url, strings.NewReader(data))
-	rq.Close = true
 
 	if len(etag) > 0 {
 		rq.Header.Set(HEADER_ETAG_CLIENT, etag)
@@ -352,6 +434,13 @@ func (c *Client4) DoApiRequest(method, url, data, etag string) (*http.Response, 
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
+	}
+
+	if c.HttpHeader != nil && len(c.HttpHeader) > 0 {
+
+		for k, v := range c.HttpHeader {
+			rq.Header.Set(k, v)
+		}
 	}
 
 	if rp, err := c.HttpClient.Do(rq); err != nil || rp == nil {
@@ -369,7 +458,6 @@ func (c *Client4) DoApiRequest(method, url, data, etag string) (*http.Response, 
 func (c *Client4) DoUploadFile(url string, data []byte, contentType string) (*FileUploadResponse, *Response) {
 	rq, _ := http.NewRequest("POST", c.ApiUrl+url, bytes.NewReader(data))
 	rq.Header.Set("Content-Type", contentType)
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -391,7 +479,6 @@ func (c *Client4) DoUploadFile(url string, data []byte, contentType string) (*Fi
 func (c *Client4) DoEmojiUploadFile(url string, data []byte, contentType string) (*Emoji, *Response) {
 	rq, _ := http.NewRequest("POST", c.ApiUrl+url, bytes.NewReader(data))
 	rq.Header.Set("Content-Type", contentType)
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -413,7 +500,6 @@ func (c *Client4) DoEmojiUploadFile(url string, data []byte, contentType string)
 func (c *Client4) DoUploadImportTeam(url string, data []byte, contentType string) (map[string]string, *Response) {
 	rq, _ := http.NewRequest("POST", c.ApiUrl+url, bytes.NewReader(data))
 	rq.Header.Set("Content-Type", contentType)
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -637,7 +723,23 @@ func (c *Client4) AutocompleteUsers(username string, etag string) (*UserAutocomp
 	}
 }
 
-// GetProfileImage gets user's profile image. Must be logged in or be a system administrator.
+// GetDefaultProfileImage gets the default user's profile image. Must be logged in.
+func (c *Client4) GetDefaultProfileImage(userId string) ([]byte, *Response) {
+	r, appErr := c.DoApiGet(c.GetUserRoute(userId)+"/image/default", "")
+	if appErr != nil {
+		return nil, BuildErrorResponse(r, appErr)
+	}
+	defer closeBody(r)
+
+	data, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, BuildErrorResponse(r, NewAppError("GetDefaultProfileImage", "model.client.read_file.app_error", nil, err.Error(), r.StatusCode))
+	}
+
+	return data, BuildResponse(r)
+}
+
+// GetProfileImage gets user's profile image. Must be logged in.
 func (c *Client4) GetProfileImage(userId, etag string) ([]byte, *Response) {
 	if r, err := c.DoApiGet(c.GetUserRoute(userId)+"/image", etag); err != nil {
 		return nil, BuildErrorResponse(r, err)
@@ -1019,6 +1121,15 @@ func (c *Client4) SendVerificationEmail(email string) (bool, *Response) {
 	}
 }
 
+// SetDefaultProfileImage resets the profile image to a default generated one
+func (c *Client4) SetDefaultProfileImage(userId string) (bool, *Response) {
+	r, err := c.DoApiDelete(c.GetUserRoute(userId) + "/image")
+	if err != nil {
+		return false, BuildErrorResponse(r, err)
+	}
+	return CheckStatusOK(r), BuildResponse(r)
+}
+
 // SetProfileImage sets profile image of the user
 func (c *Client4) SetProfileImage(userId string, data []byte) (bool, *Response) {
 	body := &bytes.Buffer{}
@@ -1036,7 +1147,6 @@ func (c *Client4) SetProfileImage(userId string, data []byte) (bool, *Response) 
 
 	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetUserRoute(userId)+"/image", bytes.NewReader(body.Bytes()))
 	rq.Header.Set("Content-Type", writer.FormDataContentType())
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -1254,6 +1364,16 @@ func (c *Client4) UpdateTeamMemberRoles(teamId, userId, newRoles string) (bool, 
 	}
 }
 
+// UpdateTeamMemberSchemeRoles will update the scheme-derived roles on a team for a user.
+func (c *Client4) UpdateTeamMemberSchemeRoles(teamId string, userId string, schemeRoles *SchemeRoles) (bool, *Response) {
+	if r, err := c.DoApiPut(c.GetTeamMemberRoute(teamId, userId)+"/schemeRoles", schemeRoles.ToJson()); err != nil {
+		return false, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
+	}
+}
+
 // UpdateTeam will update a team.
 func (c *Client4) UpdateTeam(team *Team) (*Team, *Response) {
 	if r, err := c.DoApiPut(c.GetTeamRoute(team.Id), team.ToJson()); err != nil {
@@ -1397,6 +1517,17 @@ func (c *Client4) GetTeamStats(teamId, etag string) (*TeamStats, *Response) {
 	}
 }
 
+// GetTotalUsersStats returns a total system user stats.
+// Must be authenticated.
+func (c *Client4) GetTotalUsersStats(etag string) (*UsersStats, *Response) {
+	if r, err := c.DoApiGet(c.GetTotalUsersStatsRoute(), etag); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return UsersStatsFromJson(r.Body), BuildResponse(r)
+	}
+}
+
 // GetTeamUnread will return a TeamUnread object that contains the amount of
 // unread messages and mentions the user has for the specified team.
 // Must be authenticated.
@@ -1456,6 +1587,68 @@ func (c *Client4) GetTeamInviteInfo(inviteId string) (*Team, *Response) {
 	} else {
 		defer closeBody(r)
 		return TeamFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// SetTeamIcon sets team icon of the team
+func (c *Client4) SetTeamIcon(teamId string, data []byte) (bool, *Response) {
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if part, err := writer.CreateFormFile("image", "teamIcon.png"); err != nil {
+		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.no_file.app_error", nil, err.Error(), http.StatusBadRequest)}
+	} else if _, err = io.Copy(part, bytes.NewBuffer(data)); err != nil {
+		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.no_file.app_error", nil, err.Error(), http.StatusBadRequest)}
+	}
+
+	if err := writer.Close(); err != nil {
+		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.writer.app_error", nil, err.Error(), http.StatusBadRequest)}
+	}
+
+	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetTeamRoute(teamId)+"/image", bytes.NewReader(body.Bytes()))
+	rq.Header.Set("Content-Type", writer.FormDataContentType())
+
+	if len(c.AuthToken) > 0 {
+		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
+	}
+
+	if rp, err := c.HttpClient.Do(rq); err != nil || rp == nil {
+		// set to http.StatusForbidden(403)
+		return false, &Response{StatusCode: http.StatusForbidden, Error: NewAppError(c.GetTeamRoute(teamId)+"/image", "model.client.connecting.app_error", nil, err.Error(), 403)}
+	} else {
+		defer closeBody(rp)
+
+		if rp.StatusCode >= 300 {
+			return false, BuildErrorResponse(rp, AppErrorFromJson(rp.Body))
+		} else {
+			return CheckStatusOK(rp), BuildResponse(rp)
+		}
+	}
+}
+
+// GetTeamIcon gets the team icon of the team
+func (c *Client4) GetTeamIcon(teamId, etag string) ([]byte, *Response) {
+	if r, err := c.DoApiGet(c.GetTeamRoute(teamId)+"/image", etag); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+
+		if data, err := ioutil.ReadAll(r.Body); err != nil {
+			return nil, BuildErrorResponse(r, NewAppError("GetTeamIcon", "model.client.get_team_icon.app_error", nil, err.Error(), r.StatusCode))
+		} else {
+			return data, BuildResponse(r)
+		}
+	}
+}
+
+// RemoveTeamIcon updates LastTeamIconUpdate to 0 which indicates team icon is removed.
+func (c *Client4) RemoveTeamIcon(teamId string) (bool, *Response) {
+	if r, err := c.DoApiDelete(c.GetTeamRoute(teamId) + "/image"); err != nil {
+		return false, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
 	}
 }
 
@@ -1635,9 +1828,27 @@ func (c *Client4) GetChannelByName(channelName, teamId string, etag string) (*Ch
 	}
 }
 
+func (c *Client4) GetChannelByNameIncludeDeleted(channelName, teamId string, etag string) (*Channel, *Response) {
+	if r, err := c.DoApiGet(c.GetChannelByNameRoute(channelName, teamId)+"?include_deleted=true", etag); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return ChannelFromJson(r.Body), BuildResponse(r)
+	}
+}
+
 // GetChannelByNameForTeamName returns a channel based on the provided channel name and team name strings.
 func (c *Client4) GetChannelByNameForTeamName(channelName, teamName string, etag string) (*Channel, *Response) {
 	if r, err := c.DoApiGet(c.GetChannelByNameForTeamNameRoute(channelName, teamName), etag); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return ChannelFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+func (c *Client4) GetChannelByNameForTeamNameIncludeDeleted(channelName, teamName string, etag string) (*Channel, *Response) {
+	if r, err := c.DoApiGet(c.GetChannelByNameForTeamNameRoute(channelName, teamName)+"?include_deleted=true", etag); err != nil {
 		return nil, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
@@ -1720,6 +1931,16 @@ func (c *Client4) UpdateChannelRoles(channelId, userId, roles string) (bool, *Re
 	}
 }
 
+// UpdateChannelMemberSchemeRoles will update the scheme-derived roles on a channel for a user.
+func (c *Client4) UpdateChannelMemberSchemeRoles(channelId string, userId string, schemeRoles *SchemeRoles) (bool, *Response) {
+	if r, err := c.DoApiPut(c.GetChannelMemberRoute(channelId, userId)+"/schemeRoles", schemeRoles.ToJson()); err != nil {
+		return false, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
+	}
+}
+
 // UpdateChannelNotifyProps will update the notification properties on a channel for a user.
 func (c *Client4) UpdateChannelNotifyProps(channelId, userId string, props map[string]string) (bool, *Response) {
 	if r, err := c.DoApiPut(c.GetChannelMemberRoute(channelId, userId)+"/notify_props", MapToJson(props)); err != nil {
@@ -1766,6 +1987,17 @@ func (c *Client4) RemoveUserFromChannel(channelId, userId string) (bool, *Respon
 func (c *Client4) AutocompleteChannelsForTeam(teamId, name string) (*ChannelList, *Response) {
 	query := fmt.Sprintf("?name=%v", name)
 	if r, err := c.DoApiGet(c.GetChannelsForTeamRoute(teamId)+"/autocomplete"+query, ""); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return ChannelListFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// AutocompleteChannelsForTeamForSearch will return an ordered list of your channels autocomplete suggestions
+func (c *Client4) AutocompleteChannelsForTeamForSearch(teamId, name string) (*ChannelList, *Response) {
+	query := fmt.Sprintf("?name=%v", name)
+	if r, err := c.DoApiGet(c.GetChannelsForTeamRoute(teamId)+"/search_autocomplete"+query, ""); err != nil {
 		return nil, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
@@ -1952,12 +2184,31 @@ func (c *Client4) GetPostsBefore(channelId, postId string, page, perPage int, et
 
 // SearchPosts returns any posts with matching terms string.
 func (c *Client4) SearchPosts(teamId string, terms string, isOrSearch bool) (*PostList, *Response) {
+	params := SearchParameter{
+		Terms:      &terms,
+		IsOrSearch: &isOrSearch,
+	}
+	return c.SearchPostsWithParams(teamId, &params)
+}
+
+// SearchPosts returns any posts with matching terms string.
+func (c *Client4) SearchPostsWithParams(teamId string, params *SearchParameter) (*PostList, *Response) {
+	if r, err := c.DoApiPost(c.GetTeamRoute(teamId)+"/posts/search", params.SearchParameterToJson()); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return PostListFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// SearchPosts returns any posts with matching terms string, including .
+func (c *Client4) SearchPostsWithMatches(teamId string, terms string, isOrSearch bool) (*PostSearchResults, *Response) {
 	requestBody := map[string]interface{}{"terms": terms, "is_or_search": isOrSearch}
 	if r, err := c.DoApiPost(c.GetTeamRoute(teamId)+"/posts/search", StringInterfaceToJson(requestBody)); err != nil {
 		return nil, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
-		return PostListFromJson(r.Body), BuildResponse(r)
+		return PostSearchResultsFromJson(r.Body), BuildResponse(r)
 	}
 }
 
@@ -2261,7 +2512,6 @@ func (c *Client4) UploadLicenseFile(data []byte) (bool, *Response) {
 
 	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetLicenseRoute(), bytes.NewReader(body.Bytes()))
 	rq.Header.Set("Content-Type", writer.FormDataContentType())
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -2296,7 +2546,7 @@ func (c *Client4) RemoveLicenseFile() (bool, *Response) {
 // and defaults to "standard". The "teamId" argument is optional and will limit results
 // to a specific team.
 func (c *Client4) GetAnalyticsOld(name, teamId string) (AnalyticsRows, *Response) {
-	query := fmt.Sprintf("?name=%v&teamId=%v", name, teamId)
+	query := fmt.Sprintf("?name=%v&team_id=%v", name, teamId)
 	if r, err := c.DoApiGet(c.GetAnalyticsRoute()+"/old"+query, ""); err != nil {
 		return nil, BuildErrorResponse(r, err)
 	} else {
@@ -2649,7 +2899,6 @@ func (c *Client4) GetComplianceReport(reportId string) (*Compliance, *Response) 
 func (c *Client4) DownloadComplianceReport(reportId string) ([]byte, *Response) {
 	var rq *http.Request
 	rq, _ = http.NewRequest("GET", c.ApiUrl+c.GetComplianceReportRoute(reportId), nil)
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, "BEARER "+c.AuthToken)
@@ -2754,7 +3003,6 @@ func (c *Client4) UploadBrandImage(data []byte) (bool, *Response) {
 
 	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetBrandRoute()+"/image", bytes.NewReader(body.Bytes()))
 	rq.Header.Set("Content-Type", writer.FormDataContentType())
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -2900,6 +3148,27 @@ func (c *Client4) DeauthorizeOAuthApp(appId string) (bool, *Response) {
 	} else {
 		defer closeBody(r)
 		return CheckStatusOK(r), BuildResponse(r)
+	}
+}
+
+// GetOAuthAccessToken is a test helper function for the OAuth access token endpoint.
+func (c *Client4) GetOAuthAccessToken(data url.Values) (*AccessResponse, *Response) {
+	rq, _ := http.NewRequest(http.MethodPost, c.Url+"/oauth/access_token", strings.NewReader(data.Encode()))
+	rq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if len(c.AuthToken) > 0 {
+		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
+	}
+
+	if rp, err := c.HttpClient.Do(rq); err != nil || rp == nil {
+		return nil, &Response{StatusCode: http.StatusForbidden, Error: NewAppError(c.Url+"/oauth/access_token", "model.client.connecting.app_error", nil, err.Error(), 403)}
+	} else {
+		defer closeBody(rp)
+		if rp.StatusCode >= 300 {
+			return nil, BuildErrorResponse(rp, AppErrorFromJson(rp.Body))
+		} else {
+			return AccessResponseFromJson(rp.Body), BuildResponse(rp)
+		}
 	}
 }
 
@@ -3349,6 +3618,78 @@ func (c *Client4) PatchRole(roleId string, patch *RolePatch) (*Role, *Response) 
 	}
 }
 
+// Schemes Section
+
+// CreateScheme creates a new Scheme.
+func (c *Client4) CreateScheme(scheme *Scheme) (*Scheme, *Response) {
+	if r, err := c.DoApiPost(c.GetSchemesRoute(), scheme.ToJson()); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return SchemeFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// GetScheme gets a single scheme by ID.
+func (c *Client4) GetScheme(id string) (*Scheme, *Response) {
+	if r, err := c.DoApiGet(c.GetSchemeRoute(id), ""); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return SchemeFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// Get all schemes, sorted with the most recently created first, optionally filtered by scope.
+func (c *Client4) GetSchemes(scope string, page int, perPage int) ([]*Scheme, *Response) {
+	if r, err := c.DoApiGet(c.GetSchemesRoute()+fmt.Sprintf("?scope=%v&page=%v&per_page=%v", scope, page, perPage), ""); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return SchemesFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// DeleteScheme deletes a single scheme by ID.
+func (c *Client4) DeleteScheme(id string) (bool, *Response) {
+	if r, err := c.DoApiDelete(c.GetSchemeRoute(id)); err != nil {
+		return false, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
+	}
+}
+
+// PatchScheme partially updates a scheme in the system. Any missing fields are not updated.
+func (c *Client4) PatchScheme(id string, patch *SchemePatch) (*Scheme, *Response) {
+	if r, err := c.DoApiPut(c.GetSchemeRoute(id)+"/patch", patch.ToJson()); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return SchemeFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// Get the teams using this scheme, sorted alphabetically by display name.
+func (c *Client4) GetTeamsForScheme(schemeId string, page int, perPage int) ([]*Team, *Response) {
+	if r, err := c.DoApiGet(c.GetSchemeRoute(schemeId)+fmt.Sprintf("/teams?page=%v&per_page=%v", page, perPage), ""); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return TeamListFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+// Get the channels using this scheme, sorted alphabetically by display name.
+func (c *Client4) GetChannelsForScheme(schemeId string, page int, perPage int) (ChannelList, *Response) {
+	if r, err := c.DoApiGet(c.GetSchemeRoute(schemeId)+fmt.Sprintf("/channels?page=%v&per_page=%v", page, perPage), ""); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return *ChannelListFromJson(r.Body), BuildResponse(r)
+	}
+}
+
 // Plugin Section
 
 // UploadPlugin takes an io.Reader stream pointing to the contents of a .tar.gz plugin.
@@ -3369,7 +3710,6 @@ func (c *Client4) UploadPlugin(file io.Reader) (*Manifest, *Response) {
 
 	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetPluginsRoute(), body)
 	rq.Header.Set("Content-Type", writer.FormDataContentType())
-	rq.Close = true
 
 	if len(c.AuthToken) > 0 {
 		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
@@ -3399,6 +3739,18 @@ func (c *Client4) GetPlugins() (*PluginsResponse, *Response) {
 	}
 }
 
+// GetPluginStatuses will return the plugins installed on any server in the cluster, for reporting
+// to the administrator via the system console.
+// WARNING: PLUGINS ARE STILL EXPERIMENTAL. THIS FUNCTION IS SUBJECT TO CHANGE.
+func (c *Client4) GetPluginStatuses() (PluginStatuses, *Response) {
+	if r, err := c.DoApiGet(c.GetPluginsRoute(), "/statuses"); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return PluginStatusesFromJson(r.Body), BuildResponse(r)
+	}
+}
+
 // RemovePlugin will deactivate and delete a plugin.
 // WARNING: PLUGINS ARE STILL EXPERIMENTAL. THIS FUNCTION IS SUBJECT TO CHANGE.
 func (c *Client4) RemovePlugin(id string) (bool, *Response) {
@@ -3423,8 +3775,8 @@ func (c *Client4) GetWebappPlugins() ([]*Manifest, *Response) {
 
 // ActivatePlugin will activate an plugin installed.
 // WARNING: PLUGINS ARE STILL EXPERIMENTAL. THIS FUNCTION IS SUBJECT TO CHANGE.
-func (c *Client4) ActivatePlugin(id string) (bool, *Response) {
-	if r, err := c.DoApiPost(c.GetPluginRoute(id)+"/activate", ""); err != nil {
+func (c *Client4) EnablePlugin(id string) (bool, *Response) {
+	if r, err := c.DoApiPost(c.GetPluginRoute(id)+"/enable", ""); err != nil {
 		return false, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
@@ -3434,8 +3786,8 @@ func (c *Client4) ActivatePlugin(id string) (bool, *Response) {
 
 // DeactivatePlugin will deactivate an active plugin.
 // WARNING: PLUGINS ARE STILL EXPERIMENTAL. THIS FUNCTION IS SUBJECT TO CHANGE.
-func (c *Client4) DeactivatePlugin(id string) (bool, *Response) {
-	if r, err := c.DoApiPost(c.GetPluginRoute(id)+"/deactivate", ""); err != nil {
+func (c *Client4) DisablePlugin(id string) (bool, *Response) {
+	if r, err := c.DoApiPost(c.GetPluginRoute(id)+"/disable", ""); err != nil {
 		return false, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
@@ -3443,55 +3795,70 @@ func (c *Client4) DeactivatePlugin(id string) (bool, *Response) {
 	}
 }
 
-// SetTeamIcon sets team icon of the team
-func (c *Client4) SetTeamIcon(teamId string, data []byte) (bool, *Response) {
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	if part, err := writer.CreateFormFile("image", "teamIcon.png"); err != nil {
-		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.no_file.app_error", nil, err.Error(), http.StatusBadRequest)}
-	} else if _, err = io.Copy(part, bytes.NewBuffer(data)); err != nil {
-		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.no_file.app_error", nil, err.Error(), http.StatusBadRequest)}
-	}
-
-	if err := writer.Close(); err != nil {
-		return false, &Response{Error: NewAppError("SetTeamIcon", "model.client.set_team_icon.writer.app_error", nil, err.Error(), http.StatusBadRequest)}
-	}
-
-	rq, _ := http.NewRequest("POST", c.ApiUrl+c.GetTeamRoute(teamId)+"/image", bytes.NewReader(body.Bytes()))
-	rq.Header.Set("Content-Type", writer.FormDataContentType())
-	rq.Close = true
-
-	if len(c.AuthToken) > 0 {
-		rq.Header.Set(HEADER_AUTH, c.AuthType+" "+c.AuthToken)
-	}
-
-	if rp, err := c.HttpClient.Do(rq); err != nil || rp == nil {
-		// set to http.StatusForbidden(403)
-		return false, &Response{StatusCode: http.StatusForbidden, Error: NewAppError(c.GetTeamRoute(teamId)+"/image", "model.client.connecting.app_error", nil, err.Error(), 403)}
+// UpdateChannelScheme will update a channel's scheme.
+func (c *Client4) UpdateChannelScheme(channelId, schemeId string) (bool, *Response) {
+	sip := &SchemeIDPatch{SchemeID: &schemeId}
+	if r, err := c.DoApiPut(c.GetChannelSchemeRoute(channelId), sip.ToJson()); err != nil {
+		return false, BuildErrorResponse(r, err)
 	} else {
-		defer closeBody(rp)
-
-		if rp.StatusCode >= 300 {
-			return false, BuildErrorResponse(rp, AppErrorFromJson(rp.Body))
-		} else {
-			return CheckStatusOK(rp), BuildResponse(rp)
-		}
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
 	}
 }
 
-// GetTeamIcon gets the team icon of the team
-func (c *Client4) GetTeamIcon(teamId, etag string) ([]byte, *Response) {
-	if r, err := c.DoApiGet(c.GetTeamRoute(teamId)+"/image", etag); err != nil {
+// UpdateTeamScheme will update a team's scheme.
+func (c *Client4) UpdateTeamScheme(teamId, schemeId string) (bool, *Response) {
+	sip := &SchemeIDPatch{SchemeID: &schemeId}
+	if r, err := c.DoApiPut(c.GetTeamSchemeRoute(teamId), sip.ToJson()); err != nil {
+		return false, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return CheckStatusOK(r), BuildResponse(r)
+	}
+}
+
+// GetRedirectLocation retrieves the value of the 'Location' header of an HTTP response for a given URL.
+func (c *Client4) GetRedirectLocation(urlParam, etag string) (string, *Response) {
+	url := fmt.Sprintf("%s?url=%s", c.GetRedirectLocationRoute(), url.QueryEscape(urlParam))
+	if r, err := c.DoApiGet(url, etag); err != nil {
+		return "", BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return MapFromJson(r.Body)["location"], BuildResponse(r)
+	}
+}
+
+func (c *Client4) RegisterServiceTermsAction(userId, serviceTermsId string, accepted bool) (*bool, *Response) {
+	url := c.GetRegisterServiceTermsRoute(userId)
+	data := map[string]interface{}{"serviceTermsId": serviceTermsId, "accepted": accepted}
+
+	if r, err := c.DoApiPost(url, StringInterfaceToJson(data)); err != nil {
 		return nil, BuildErrorResponse(r, err)
 	} else {
 		defer closeBody(r)
+		return NewBool(CheckStatusOK(r)), BuildResponse(r)
+	}
+}
 
-		if data, err := ioutil.ReadAll(r.Body); err != nil {
-			return nil, BuildErrorResponse(r, NewAppError("GetTeamIcon", "model.client.get_team_icon.app_error", nil, err.Error(), r.StatusCode))
-		} else {
-			return data, BuildResponse(r)
-		}
+func (c *Client4) GetServiceTerms(etag string) (*ServiceTerms, *Response) {
+	url := c.GetServiceTermsRoute()
+
+	if r, err := c.DoApiGet(url, etag); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return ServiceTermsFromJson(r.Body), BuildResponse(r)
+	}
+}
+
+func (c *Client4) CreateServiceTerms(text, userId string) (*ServiceTerms, *Response) {
+	url := c.GetServiceTermsRoute()
+
+	data := map[string]string{"text": text}
+	if r, err := c.DoApiPost(url, MapToJson(data)); err != nil {
+		return nil, BuildErrorResponse(r, err)
+	} else {
+		defer closeBody(r)
+		return ServiceTermsFromJson(r.Body), BuildResponse(r)
 	}
 }

@@ -4,13 +4,14 @@
 package app
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 
-	l4g "github.com/alecthomas/log4go"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/utils"
@@ -106,8 +107,8 @@ func (a *App) TriggerWebhook(payload *model.OutgoingWebhookPayload, hook *model.
 				req, _ := http.NewRequest("POST", url, body)
 				req.Header.Set("Content-Type", contentType)
 				req.Header.Set("Accept", "application/json")
-				if resp, err := a.HTTPClient(false).Do(req); err != nil {
-					l4g.Error(utils.T("api.post.handle_webhook_events_and_forget.event_post.error"), err.Error())
+				if resp, err := a.HTTPService.MakeClient(false).Do(req); err != nil {
+					mlog.Error(fmt.Sprintf("Event POST failed, err=%s", err.Error()))
 				} else {
 					defer consumeAndClose(resp)
 
@@ -132,9 +133,15 @@ func (a *App) TriggerWebhook(payload *model.OutgoingWebhookPayload, hook *model.
 						if len(webhookResp.Attachments) > 0 {
 							webhookResp.Props["attachments"] = webhookResp.Attachments
 						}
+						if a.Config().ServiceSettings.EnablePostUsernameOverride && hook.Username != "" && webhookResp.Username == "" {
+							webhookResp.Username = hook.Username
+						}
 
+						if a.Config().ServiceSettings.EnablePostIconOverride && hook.IconURL != "" && webhookResp.IconURL == "" {
+							webhookResp.IconURL = hook.IconURL
+						}
 						if _, err := a.CreateWebhookPost(hook.CreatorId, channel, text, webhookResp.Username, webhookResp.IconURL, webhookResp.Props, webhookResp.Type, postRootId); err != nil {
-							l4g.Error(utils.T("api.post.handle_webhook_events_and_forget.create_post.error"), err)
+							mlog.Error(fmt.Sprintf("Failed to create response post, err=%v", err))
 						}
 					}
 				}
@@ -258,7 +265,7 @@ func (a *App) CreateWebhookPost(userId string, channel *model.Channel, text, ove
 		for key, val := range props {
 			if key == "attachments" {
 				if attachments, success := val.([]*model.SlackAttachment); success {
-					parseSlackAttachment(post, attachments)
+					model.ParseSlackAttachment(post, attachments)
 				}
 			} else if key != "override_icon_url" && key != "override_username" && key != "from_webhook" {
 				post.AddProp(key, val)
@@ -586,6 +593,8 @@ func (a *App) HandleIncomingWebhook(hookId string, req *model.IncomingWebhookReq
 		hook = result.Data.(*model.IncomingWebhook)
 	}
 
+	uchan := a.Srv.Store.User().Get(hook.UserId)
+
 	if len(req.Props) == 0 {
 		req.Props = make(model.StringInterface)
 	}
@@ -632,8 +641,19 @@ func (a *App) HandleIncomingWebhook(hookId string, req *model.IncomingWebhookReq
 		}
 	}
 
+	if hook.ChannelLocked && hook.ChannelId != channel.Id {
+		return model.NewAppError("HandleIncomingWebhook", "web.incoming_webhook.channel_locked.app_error", nil, "", http.StatusForbidden)
+	}
+
+	var user *model.User
+	if result := <-uchan; result.Err != nil {
+		return model.NewAppError("HandleIncomingWebhook", "web.incoming_webhook.user.app_error", nil, "err="+result.Err.Message, http.StatusForbidden)
+	} else {
+		user = result.Data.(*model.User)
+	}
+
 	if a.License() != nil && *a.Config().TeamSettings.ExperimentalTownSquareIsReadOnly &&
-		channel.Name == model.DEFAULT_CHANNEL {
+		channel.Name == model.DEFAULT_CHANNEL && !a.RolesGrantPermission(user.GetRoles(), model.PERMISSION_MANAGE_SYSTEM.Id) {
 		return model.NewAppError("HandleIncomingWebhook", "api.post.create_post.town_square_read_only", nil, "", http.StatusForbidden)
 	}
 

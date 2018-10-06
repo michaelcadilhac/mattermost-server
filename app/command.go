@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	l4g "github.com/alecthomas/log4go"
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/utils"
 	goi18n "github.com/nicksnyder/go-i18n/i18n"
@@ -38,7 +38,7 @@ func GetCommandProvider(name string) CommandProvider {
 }
 
 func (a *App) CreateCommandPost(post *model.Post, teamId string, response *model.CommandResponse) (*model.Post, *model.AppError) {
-	post.Message = parseSlackLinksToMarkdown(response.Text)
+	post.Message = model.ParseSlackLinksToMarkdown(response.Text)
 	post.CreateAt = model.GetMillis()
 
 	if strings.HasPrefix(post.Type, model.POST_SYSTEM_MESSAGE_PREFIX) {
@@ -47,7 +47,7 @@ func (a *App) CreateCommandPost(post *model.Post, teamId string, response *model
 	}
 
 	if response.Attachments != nil {
-		parseSlackAttachment(post, response.Attachments)
+		model.ParseSlackAttachment(post, response.Attachments)
 	}
 
 	if response.ResponseType == model.COMMAND_RESPONSE_TYPE_IN_CHANNEL {
@@ -207,7 +207,7 @@ func (a *App) ExecuteCommand(args *model.CommandArgs) (*model.CommandResponse, *
 		teamCmds := result.Data.([]*model.Command)
 		for _, cmd := range teamCmds {
 			if trigger == cmd.Trigger {
-				l4g.Debug(fmt.Sprintf(utils.T("api.command.execute_command.debug"), trigger, args.UserId))
+				mlog.Debug(fmt.Sprintf(utils.T("api.command.execute_command.debug"), trigger, args.UserId))
 
 				p := url.Values{}
 				p.Set("token", cmd.Token)
@@ -230,19 +230,25 @@ func (a *App) ExecuteCommand(args *model.CommandArgs) (*model.CommandResponse, *
 					p.Set("response_url", args.SiteURL+"/hooks/commands/"+hook.Id)
 				}
 
-				method := "POST"
+				var req *http.Request
 				if cmd.Method == model.COMMAND_METHOD_GET {
-					method = "GET"
+					req, _ = http.NewRequest(http.MethodGet, cmd.URL, nil)
+
+					if req.URL.RawQuery != "" {
+						req.URL.RawQuery += "&"
+					}
+					req.URL.RawQuery += p.Encode()
+				} else {
+					req, _ = http.NewRequest(http.MethodPost, cmd.URL, strings.NewReader(p.Encode()))
 				}
 
-				req, _ := http.NewRequest(method, cmd.URL, strings.NewReader(p.Encode()))
 				req.Header.Set("Accept", "application/json")
 				req.Header.Set("Authorization", "Token "+cmd.Token)
 				if cmd.Method == model.COMMAND_METHOD_POST {
 					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 				}
 
-				if resp, err := a.HTTPClient(false).Do(req); err != nil {
+				if resp, err := a.HTTPService.MakeClient(false).Do(req); err != nil {
 					return nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]interface{}{"Trigger": trigger}, err.Error(), http.StatusInternalServerError)
 				} else {
 					if resp.StatusCode == http.StatusOK {
@@ -308,7 +314,7 @@ func (a *App) HandleCommandResponse(command *model.Command, args *model.CommandA
 	response.Attachments = a.ProcessSlackAttachments(response.Attachments)
 
 	if _, err := a.CreateCommandPost(post, args.TeamId, response); err != nil {
-		l4g.Error(err.Error())
+		mlog.Error(err.Error())
 	}
 
 	return response, nil

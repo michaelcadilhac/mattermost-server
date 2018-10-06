@@ -22,7 +22,6 @@ const (
 	USER_NOTIFY_NONE             = "none"
 	DESKTOP_NOTIFY_PROP          = "desktop"
 	DESKTOP_SOUND_NOTIFY_PROP    = "desktop_sound"
-	DESKTOP_DURATION_NOTIFY_PROP = "desktop_duration"
 	MARK_UNREAD_NOTIFY_PROP      = "mark_unread"
 	PUSH_NOTIFY_PROP             = "push"
 	PUSH_STATUS_NOTIFY_PROP      = "push_status"
@@ -49,32 +48,33 @@ const (
 )
 
 type User struct {
-	Id                 string    `json:"id"`
-	CreateAt           int64     `json:"create_at,omitempty"`
-	UpdateAt           int64     `json:"update_at,omitempty"`
-	DeleteAt           int64     `json:"delete_at"`
-	Username           string    `json:"username"`
-	Password           string    `json:"password,omitempty"`
-	AuthData           *string   `json:"auth_data,omitempty"`
-	AuthService        string    `json:"auth_service"`
-	Email              string    `json:"email"`
-	EmailVerified      bool      `json:"email_verified,omitempty"`
-	Nickname           string    `json:"nickname"`
-	FirstName          string    `json:"first_name"`
-	LastName           string    `json:"last_name"`
-	Position           string    `json:"position"`
-	Roles              string    `json:"roles"`
-	AllowMarketing     bool      `json:"allow_marketing,omitempty"`
-	Props              StringMap `json:"props,omitempty"`
-	NotifyProps        StringMap `json:"notify_props,omitempty"`
-	LastPasswordUpdate int64     `json:"last_password_update,omitempty"`
-	LastPictureUpdate  int64     `json:"last_picture_update,omitempty"`
-	FailedAttempts     int       `json:"failed_attempts,omitempty"`
-	Locale             string    `json:"locale"`
-	Timezone           StringMap `json:"timezone"`
-	MfaActive          bool      `json:"mfa_active,omitempty"`
-	MfaSecret          string    `json:"mfa_secret,omitempty"`
-	LastActivityAt     int64     `db:"-" json:"last_activity_at,omitempty"`
+	Id                     string    `json:"id"`
+	CreateAt               int64     `json:"create_at,omitempty"`
+	UpdateAt               int64     `json:"update_at,omitempty"`
+	DeleteAt               int64     `json:"delete_at"`
+	Username               string    `json:"username"`
+	Password               string    `json:"password,omitempty"`
+	AuthData               *string   `json:"auth_data,omitempty"`
+	AuthService            string    `json:"auth_service"`
+	Email                  string    `json:"email"`
+	EmailVerified          bool      `json:"email_verified,omitempty"`
+	Nickname               string    `json:"nickname"`
+	FirstName              string    `json:"first_name"`
+	LastName               string    `json:"last_name"`
+	Position               string    `json:"position"`
+	Roles                  string    `json:"roles"`
+	AllowMarketing         bool      `json:"allow_marketing,omitempty"`
+	Props                  StringMap `json:"props,omitempty"`
+	NotifyProps            StringMap `json:"notify_props,omitempty"`
+	LastPasswordUpdate     int64     `json:"last_password_update,omitempty"`
+	LastPictureUpdate      int64     `json:"last_picture_update,omitempty"`
+	FailedAttempts         int       `json:"failed_attempts,omitempty"`
+	Locale                 string    `json:"locale"`
+	Timezone               StringMap `json:"timezone"`
+	MfaActive              bool      `json:"mfa_active,omitempty"`
+	MfaSecret              string    `json:"mfa_secret,omitempty"`
+	LastActivityAt         int64     `db:"-" json:"last_activity_at,omitempty"`
+	AcceptedServiceTermsId string    `json:"accepted_service_terms_id,omitempty"`
 }
 
 type UserPatch struct {
@@ -133,7 +133,7 @@ func (u *User) IsValid() *AppError {
 		return InvalidUserError("username", u.Id)
 	}
 
-	if len(u.Email) > USER_EMAIL_MAX_LENGTH || len(u.Email) == 0 {
+	if len(u.Email) > USER_EMAIL_MAX_LENGTH || len(u.Email) == 0 || !IsValidEmail(u.Email) {
 		return InvalidUserError("email", u.Id)
 	}
 
@@ -407,11 +407,11 @@ func (u *User) AddNotifyProp(key string, value string) {
 }
 
 func (u *User) GetFullName() string {
-	if u.FirstName != "" && u.LastName != "" {
+	if len(u.FirstName) > 0 && len(u.LastName) > 0 {
 		return u.FirstName + " " + u.LastName
-	} else if u.FirstName != "" {
+	} else if len(u.FirstName) > 0 {
 		return u.FirstName
-	} else if u.LastName != "" {
+	} else if len(u.LastName) > 0 {
 		return u.LastName
 	} else {
 		return ""
@@ -422,13 +422,13 @@ func (u *User) GetDisplayName(nameFormat string) string {
 	displayName := u.Username
 
 	if nameFormat == SHOW_NICKNAME_FULLNAME {
-		if u.Nickname != "" {
+		if len(u.Nickname) > 0 {
 			displayName = u.Nickname
-		} else if fullName := u.GetFullName(); fullName != "" {
+		} else if fullName := u.GetFullName(); len(fullName) > 0 {
 			displayName = fullName
 		}
 	} else if nameFormat == SHOW_FULLNAME {
-		if fullName := u.GetFullName(); fullName != "" {
+		if fullName := u.GetFullName(); len(fullName) > 0 {
 			displayName = fullName
 		}
 	}
@@ -496,6 +496,14 @@ func (u *User) IsLDAPUser() bool {
 
 func (u *User) IsSAMLUser() bool {
 	return u.AuthService == USER_AUTH_SERVICE_SAML
+}
+
+func (u *User) GetPreferredTimezone() string {
+	if u.Timezone["useAutomaticTimezone"] == "true" {
+		return u.Timezone["automaticTimezone"]
+	}
+
+	return u.Timezone["manualTimezone"]
 }
 
 // UserFromJson will decode the input and return a User
@@ -566,6 +574,7 @@ var restrictedUsernames = []string{
 	"all",
 	"channel",
 	"matterbot",
+	"system",
 }
 
 func IsValidUsername(s string) bool {

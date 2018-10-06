@@ -172,6 +172,56 @@ func TestSaveReaction(t *testing.T) {
 		}
 		th.AddPermissionToRole(model.PERMISSION_ADD_REACTION.Id, model.CHANNEL_USER_ROLE_ID)
 	})
+
+	t.Run("unable-to-react-in-read-only-town-square", func(t *testing.T) {
+		th.LoginBasic()
+
+		channel, err := th.App.GetChannelByName("town-square", th.BasicTeam.Id, true)
+		assert.Nil(t, err)
+		post := th.CreatePostWithClient(th.Client, channel)
+
+		th.App.SetLicense(model.NewTestLicense())
+		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.TeamSettings.ExperimentalTownSquareIsReadOnly = true })
+
+		reaction := &model.Reaction{
+			UserId:    userId,
+			PostId:    post.Id,
+			EmojiName: "smile",
+		}
+
+		_, resp := Client.SaveReaction(reaction)
+		CheckForbiddenStatus(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(post.Id); err != nil || len(reactions) != 0 {
+			t.Fatal("should have not created a reaction")
+		}
+
+		th.App.RemoveLicense()
+		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.TeamSettings.ExperimentalTownSquareIsReadOnly = false })
+	})
+
+	t.Run("unable-to-react-in-an-archived-channel", func(t *testing.T) {
+		th.LoginBasic()
+
+		channel := th.CreatePublicChannel()
+		post := th.CreatePostWithClient(th.Client, channel)
+
+		reaction := &model.Reaction{
+			UserId:    userId,
+			PostId:    post.Id,
+			EmojiName: "smile",
+		}
+
+		err := th.App.DeleteChannel(channel, userId)
+		assert.Nil(t, err)
+
+		_, resp := Client.SaveReaction(reaction)
+		CheckForbiddenStatus(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(post.Id); err != nil || len(reactions) != 0 {
+			t.Fatal("should have not created a reaction")
+		}
+	})
 }
 
 func TestGetReactions(t *testing.T) {
@@ -450,5 +500,70 @@ func TestDeleteReaction(t *testing.T) {
 			t.Fatal("should have not deleted a reactions")
 		}
 		th.AddPermissionToRole(model.PERMISSION_REMOVE_OTHERS_REACTIONS.Id, model.SYSTEM_ADMIN_ROLE_ID)
+	})
+
+	t.Run("unable-to-delete-reactions-in-read-only-town-square", func(t *testing.T) {
+		th.LoginBasic()
+
+		channel, err := th.App.GetChannelByName("town-square", th.BasicTeam.Id, true)
+		assert.Nil(t, err)
+		post := th.CreatePostWithClient(th.Client, channel)
+
+		th.App.SetLicense(model.NewTestLicense())
+
+		reaction := &model.Reaction{
+			UserId:    userId,
+			PostId:    post.Id,
+			EmojiName: "smile",
+		}
+
+		r1, resp := Client.SaveReaction(reaction)
+		CheckNoError(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(postId); err != nil || len(reactions) != 1 {
+			t.Fatal("should have created a reaction")
+		}
+
+		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.TeamSettings.ExperimentalTownSquareIsReadOnly = true })
+
+		_, resp = th.SystemAdminClient.DeleteReaction(r1)
+		CheckForbiddenStatus(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(postId); err != nil || len(reactions) != 1 {
+			t.Fatal("should have not deleted a reaction")
+		}
+
+		th.App.RemoveLicense()
+		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.TeamSettings.ExperimentalTownSquareIsReadOnly = false })
+	})
+
+	t.Run("unable-to-delete-reactions-in-an-archived-channel", func(t *testing.T) {
+		th.LoginBasic()
+
+		channel := th.CreatePublicChannel()
+		post := th.CreatePostWithClient(th.Client, channel)
+
+		reaction := &model.Reaction{
+			UserId:    userId,
+			PostId:    post.Id,
+			EmojiName: "smile",
+		}
+
+		r1, resp := Client.SaveReaction(reaction)
+		CheckNoError(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(postId); err != nil || len(reactions) != 1 {
+			t.Fatal("should have created a reaction")
+		}
+
+		err := th.App.DeleteChannel(channel, userId)
+		assert.Nil(t, err)
+
+		_, resp = Client.SaveReaction(r1)
+		CheckForbiddenStatus(t, resp)
+
+		if reactions, err := th.App.GetReactionsForPost(post.Id); err != nil || len(reactions) != 1 {
+			t.Fatal("should have not deleted a reaction")
+		}
 	})
 }

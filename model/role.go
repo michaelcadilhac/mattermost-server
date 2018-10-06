@@ -39,6 +39,7 @@ type Role struct {
 	DeleteAt      int64    `json:"delete_at"`
 	Permissions   []string `json:"permissions"`
 	SchemeManaged bool     `json:"scheme_managed"`
+	BuiltIn       bool     `json:"built_in"`
 }
 
 type RolePatch struct {
@@ -187,6 +188,7 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_USE_SLASH_COMMANDS.Id,
 		},
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	roles[CHANNEL_ADMIN_ROLE_ID] = &Role{
@@ -197,6 +199,7 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_MANAGE_CHANNEL_ROLES.Id,
 		},
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	roles[TEAM_USER_ROLE_ID] = &Role{
@@ -210,6 +213,7 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_VIEW_TEAM.Id,
 		},
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	roles[TEAM_POST_ALL_ROLE_ID] = &Role{
@@ -219,7 +223,8 @@ func MakeDefaultRoles() map[string]*Role {
 		Permissions: []string{
 			PERMISSION_CREATE_POST.Id,
 		},
-		SchemeManaged: true,
+		SchemeManaged: false,
+		BuiltIn:       true,
 	}
 
 	roles[TEAM_POST_ALL_PUBLIC_ROLE_ID] = &Role{
@@ -229,7 +234,8 @@ func MakeDefaultRoles() map[string]*Role {
 		Permissions: []string{
 			PERMISSION_CREATE_POST_PUBLIC.Id,
 		},
-		SchemeManaged: true,
+		SchemeManaged: false,
+		BuiltIn:       true,
 	}
 
 	roles[TEAM_ADMIN_ROLE_ID] = &Role{
@@ -237,7 +243,6 @@ func MakeDefaultRoles() map[string]*Role {
 		DisplayName: "authentication.roles.team_admin.name",
 		Description: "authentication.roles.team_admin.description",
 		Permissions: []string{
-			PERMISSION_EDIT_OTHERS_POSTS.Id,
 			PERMISSION_REMOVE_USER_FROM_TEAM.Id,
 			PERMISSION_MANAGE_TEAM.Id,
 			PERMISSION_IMPORT_TEAM.Id,
@@ -249,6 +254,7 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_MANAGE_WEBHOOKS.Id,
 		},
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_USER_ROLE_ID] = &Role{
@@ -261,6 +267,7 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_PERMANENT_DELETE_USER.Id,
 		},
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_POST_ALL_ROLE_ID] = &Role{
@@ -270,7 +277,8 @@ func MakeDefaultRoles() map[string]*Role {
 		Permissions: []string{
 			PERMISSION_CREATE_POST.Id,
 		},
-		SchemeManaged: true,
+		SchemeManaged: false,
+		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_POST_ALL_PUBLIC_ROLE_ID] = &Role{
@@ -280,7 +288,8 @@ func MakeDefaultRoles() map[string]*Role {
 		Permissions: []string{
 			PERMISSION_CREATE_POST_PUBLIC.Id,
 		},
-		SchemeManaged: true,
+		SchemeManaged: false,
+		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_USER_ACCESS_TOKEN_ROLE_ID] = &Role{
@@ -292,7 +301,8 @@ func MakeDefaultRoles() map[string]*Role {
 			PERMISSION_READ_USER_ACCESS_TOKEN.Id,
 			PERMISSION_REVOKE_USER_ACCESS_TOKEN.Id,
 		},
-		SchemeManaged: true,
+		SchemeManaged: false,
+		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_ADMIN_ROLE_ID] = &Role{
@@ -321,6 +331,7 @@ func MakeDefaultRoles() map[string]*Role {
 							PERMISSION_MANAGE_SYSTEM_WIDE_OAUTH.Id,
 							PERMISSION_MANAGE_OTHERS_WEBHOOKS.Id,
 							PERMISSION_EDIT_OTHER_USERS.Id,
+							PERMISSION_EDIT_OTHERS_POSTS.Id,
 							PERMISSION_MANAGE_OAUTH.Id,
 							PERMISSION_INVITE_USER.Id,
 							PERMISSION_DELETE_POST.Id,
@@ -345,6 +356,7 @@ func MakeDefaultRoles() map[string]*Role {
 			roles[CHANNEL_ADMIN_ROLE_ID].Permissions...,
 		),
 		SchemeManaged: true,
+		BuiltIn:       true,
 	}
 
 	return roles

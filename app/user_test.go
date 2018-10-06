@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/mattermost/mattermost-server/einterfaces"
 	"github.com/mattermost/mattermost-server/model"
@@ -88,7 +89,7 @@ func TestCreateOAuthUser(t *testing.T) {
 
 	th.App.PermanentDeleteUser(user)
 
-	th.App.Config().TeamSettings.EnableUserCreation = false
+	*th.App.Config().TeamSettings.EnableUserCreation = false
 
 	_, err = th.App.CreateOAuthUser(model.USER_AUTH_SERVICE_GITLAB, strings.NewReader(json), th.BasicTeam.Id)
 	if err == nil {
@@ -96,26 +97,8 @@ func TestCreateOAuthUser(t *testing.T) {
 	}
 }
 
-func TestDeactivateSSOUser(t *testing.T) {
-	th := Setup().InitBasic()
-	defer th.TearDown()
-
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	glUser := oauthgitlab.GitLabUser{Id: int64(r.Intn(1000)) + 1, Username: "o" + model.NewId(), Email: model.NewId() + "@simulator.amazonses.com", Name: "Joram Wilander"}
-
-	json := glUser.ToJson()
-	user, err := th.App.CreateOAuthUser(model.USER_AUTH_SERVICE_GITLAB, strings.NewReader(json), th.BasicTeam.Id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer th.App.PermanentDeleteUser(user)
-
-	_, err = th.App.UpdateNonSSOUserActive(user.Id, false)
-	assert.Equal(t, "api.user.update_active.no_deactivate_sso.app_error", err.Id)
-}
-
 func TestCreateProfileImage(t *testing.T) {
-	b, err := CreateProfileImage("Corey Hulen", "eo1zkdr96pdj98pjmq8zy35wba", "luximbi.ttf")
+	b, err := CreateProfileImage("Corey Hulen", "eo1zkdr96pdj98pjmq8zy35wba", "nunito-bold.ttf")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +114,25 @@ func TestCreateProfileImage(t *testing.T) {
 	if img.At(1, 1) != colorful {
 		t.Fatal("Failed to create correct color")
 	}
+}
+
+func TestSetDefaultProfileImage(t *testing.T) {
+	th := Setup().InitBasic()
+	defer th.TearDown()
+
+	err := th.App.SetDefaultProfileImage(&model.User{
+		Id:       model.NewId(),
+		Username: "notvaliduser",
+	})
+	require.Error(t, err)
+
+	user := th.BasicUser
+
+	err = th.App.SetDefaultProfileImage(user)
+	require.Nil(t, err)
+
+	user = getUserFromDB(th.App, user.Id, t)
+	assert.Equal(t, int64(0), user.LastPictureUpdate)
 }
 
 func TestUpdateUserToRestrictedDomain(t *testing.T) {
@@ -267,25 +269,25 @@ func TestUpdateOAuthUserAttrs(t *testing.T) {
 }
 
 func getUserFromDB(a *App, id string, t *testing.T) *model.User {
-	if user, err := a.GetUser(id); err != nil {
-		t.Fatal("user is not found")
+	user, err := a.GetUser(id)
+	if err != nil {
+		t.Fatal("user is not found", err)
 		return nil
-	} else {
-		return user
 	}
+	return user
 }
 
 func getGitlabUserPayload(gitlabUser oauthgitlab.GitLabUser, t *testing.T) []byte {
 	var payload []byte
 	var err error
 	if payload, err = json.Marshal(gitlabUser); err != nil {
-		t.Fatal("Serialization of gitlab user to json failed")
+		t.Fatal("Serialization of gitlab user to json failed", err)
 	}
 
 	return payload
 }
 
-func createGitlabUser(t *testing.T, a *App, email string, username string) (*model.User, oauthgitlab.GitLabUser) {
+func createGitlabUser(t *testing.T, a *App, username string, email string) (*model.User, oauthgitlab.GitLabUser) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	gitlabUserObj := oauthgitlab.GitLabUser{Id: int64(r.Intn(1000)) + 1, Username: username, Login: "user1", Email: email, Name: "Test User"}
 	gitlabUser := getGitlabUserPayload(gitlabUserObj, t)
@@ -294,7 +296,7 @@ func createGitlabUser(t *testing.T, a *App, email string, username string) (*mod
 	var err *model.AppError
 
 	if user, err = a.CreateOAuthUser("gitlab", bytes.NewReader(gitlabUser), ""); err != nil {
-		t.Fatal("unable to create the user")
+		t.Fatal("unable to create the user", err)
 	}
 
 	return user, gitlabUserObj
@@ -497,4 +499,88 @@ func TestCreateUserWithToken(t *testing.T) {
 			t.Fatal("The token must be deleted after be used")
 		}
 	})
+}
+
+func TestPermanentDeleteUser(t *testing.T) {
+	th := Setup().InitBasic()
+	defer th.TearDown()
+
+	b := []byte("testimage")
+
+	finfo, err := th.App.DoUploadFile(time.Now(), th.BasicTeam.Id, th.BasicChannel.Id, th.BasicUser.Id, "testfile.txt", b)
+
+	if err != nil {
+		t.Log(err)
+		t.Fatal("Unable to upload file")
+	}
+
+	err = th.App.PermanentDeleteUser(th.BasicUser)
+	if err != nil {
+		t.Log(err)
+		t.Fatal("Unable to delete user")
+	}
+
+	res, err := th.App.FileExists(finfo.Path)
+
+	if err != nil {
+		t.Log(err)
+		t.Fatal("Unable to check whether file exists")
+	}
+
+	if res {
+		t.Log(err)
+		t.Fatal("File was not deleted on FS")
+	}
+
+	finfo, err = th.App.GetFileInfo(finfo.Id)
+
+	if finfo != nil {
+		t.Log(err)
+		t.Fatal("Unable to find finfo")
+	}
+
+	if err == nil {
+		t.Log(err)
+		t.Fatal("GetFileInfo after DeleteUser is nil")
+	}
+}
+
+func TestRecordUserServiceTermsAction(t *testing.T) {
+	th := Setup().InitBasic()
+	defer th.TearDown()
+
+	user := &model.User{
+		Email:       strings.ToLower(model.NewId()) + "success+test@example.com",
+		Nickname:    "Luke Skywalker", // trying to bring balance to the "Force", one test user at a time
+		Username:    "luke" + model.NewId(),
+		Password:    "passwd1",
+		AuthService: "",
+	}
+	user, err := th.App.CreateUser(user)
+	if err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	defer th.App.PermanentDeleteUser(user)
+
+	serviceTerms, err := th.App.CreateServiceTerms("text", user.Id)
+	if err != nil {
+		t.Fatalf("failed to create service terms: %v", err)
+	}
+
+	err = th.App.RecordUserServiceTermsAction(user.Id, serviceTerms.Id, true)
+	if err != nil {
+		t.Fatalf("failed to record user action: %v", err)
+	}
+
+	nuser, err := th.App.GetUser(user.Id)
+	assert.Equal(t, serviceTerms.Id, nuser.AcceptedServiceTermsId)
+
+	err = th.App.RecordUserServiceTermsAction(user.Id, serviceTerms.Id, false)
+	if err != nil {
+		t.Fatalf("failed to record user action: %v", err)
+	}
+
+	nuser, err = th.App.GetUser(user.Id)
+	assert.Empty(t, nuser.AcceptedServiceTermsId)
 }

@@ -16,11 +16,15 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
-	l4g "github.com/alecthomas/log4go"
-
+	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/utils"
+)
+
+const (
+	ERROR_SERVICE_TERMS_NO_ROWS_FOUND = "store.sql_service_terms_store.get.no_rows.app_error"
 )
 
 func (a *App) Config() *model.Config {
@@ -57,16 +61,12 @@ func (a *App) LoadConfig(configFile string) *model.AppError {
 	if err != nil {
 		return err
 	}
+	*cfg.ServiceSettings.SiteURL = strings.TrimRight(*cfg.ServiceSettings.SiteURL, "/")
+	a.config.Store(cfg)
 
 	a.configFile = configPath
-
-	utils.ConfigureLog(&cfg.LogSettings)
-	l4g.Info("Using config file at %s", configPath)
-
-	a.config.Store(cfg)
 	a.envConfig = envConfig
-
-	a.siteURL = strings.TrimRight(*cfg.ServiceSettings.SiteURL, "/")
+	a.siteURL = *cfg.ServiceSettings.SiteURL
 
 	a.InvokeConfigListeners(old, cfg)
 	return nil
@@ -95,13 +95,17 @@ func (a *App) ClientConfigHash() string {
 	return a.clientConfigHash
 }
 
+func (a *App) LimitedClientConfig() map[string]string {
+	return a.limitedClientConfig
+}
+
 func (a *App) EnableConfigWatch() {
 	if a.configWatcher == nil && !a.disableConfigWatch {
 		configWatcher, err := utils.NewConfigWatcher(a.ConfigFileName(), func() {
 			a.ReloadConfig()
 		})
 		if err != nil {
-			l4g.Error(err)
+			mlog.Error(fmt.Sprint(err))
 		}
 		a.configWatcher = configWatcher
 	}
@@ -184,7 +188,9 @@ func (a *App) ensureAsymmetricSigningKey() error {
 		result := <-a.Srv.Store.System().GetByName(model.SYSTEM_ASYMMETRIC_SIGNING_KEY)
 		if result.Err != nil {
 			return result.Err
-		} else if err := json.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
+		}
+
+		if err := json.Unmarshal([]byte(result.Data.(*model.System).Value), &key); err != nil {
 			return err
 		}
 	}
@@ -208,6 +214,30 @@ func (a *App) ensureAsymmetricSigningKey() error {
 	return nil
 }
 
+func (a *App) ensureInstallationDate() error {
+	_, err := a.getSystemInstallDate()
+	if err == nil {
+		return nil
+	}
+
+	result := <-a.Srv.Store.User().InferSystemInstallDate()
+	var installationDate int64
+	if result.Err == nil && result.Data.(int64) > 0 {
+		installationDate = result.Data.(int64)
+	} else {
+		installationDate = utils.MillisFromTime(time.Now())
+	}
+
+	result = <-a.Srv.Store.System().SaveOrUpdate(&model.System{
+		Name:  model.SYSTEM_INSTALLATION_DATE_KEY,
+		Value: strconv.FormatInt(installationDate, 10),
+	})
+	if result.Err != nil {
+		return result.Err
+	}
+	return nil
+}
+
 // AsymmetricSigningKey will return a private key that can be used for asymmetric signing.
 func (a *App) AsymmetricSigningKey() *ecdsa.PrivateKey {
 	return a.asymmetricSigningKey
@@ -215,10 +245,24 @@ func (a *App) AsymmetricSigningKey() *ecdsa.PrivateKey {
 
 func (a *App) regenerateClientConfig() {
 	a.clientConfig = utils.GenerateClientConfig(a.Config(), a.DiagnosticId(), a.License())
+
+	if a.clientConfig["EnableCustomServiceTerms"] == "true" {
+		serviceTerms, err := a.GetLatestServiceTerms()
+		if err != nil {
+			mlog.Err(err)
+		} else {
+			a.clientConfig["CustomServiceTermsId"] = serviceTerms.Id
+		}
+	}
+
+	a.limitedClientConfig = utils.GenerateLimitedClientConfig(a.Config(), a.DiagnosticId(), a.License())
+
 	if key := a.AsymmetricSigningKey(); key != nil {
 		der, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
 		a.clientConfig["AsymmetricSigningPublicKey"] = base64.StdEncoding.EncodeToString(der)
+		a.limitedClientConfig["AsymmetricSigningPublicKey"] = base64.StdEncoding.EncodeToString(der)
 	}
+
 	clientConfigJSON, _ := json.Marshal(a.clientConfig)
 	a.clientConfigHash = fmt.Sprintf("%x", md5.Sum(clientConfigJSON))
 }
@@ -292,6 +336,24 @@ func (a *App) ClientConfigWithComputed() map[string]string {
 	// by the client.
 	respCfg["NoAccounts"] = strconv.FormatBool(a.IsFirstUserAccount())
 	respCfg["MaxPostSize"] = strconv.Itoa(a.MaxPostSize())
+	respCfg["InstallationDate"] = ""
+	if installationDate, err := a.getSystemInstallDate(); err == nil {
+		respCfg["InstallationDate"] = strconv.FormatInt(installationDate, 10)
+	}
+
+	return respCfg
+}
+
+// LimitedClientConfigWithComputed gets the configuration in a format suitable for sending to the client.
+func (a *App) LimitedClientConfigWithComputed() map[string]string {
+	respCfg := map[string]string{}
+	for k, v := range a.LimitedClientConfig() {
+		respCfg[k] = v
+	}
+
+	// These properties are not configurable, but nevertheless represent configuration expected
+	// by the client.
+	respCfg["NoAccounts"] = strconv.FormatBool(a.IsFirstUserAccount())
 
 	return respCfg
 }
